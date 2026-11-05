@@ -17,6 +17,9 @@ public:
     void stop();
     // Gain percentages: 0 = mute, 100 = original v0.4 level, 200 = twice that level.
     void setVolumes(int psg, int fm, int dac, int master);
+    // Diagnostic: bypass separate FM/DAC gain routing and mix the entire original Nuked output.
+    void setYamahaCombined(bool enabled) { yamahaCombined_ = enabled; }
+    void setAnalogLowpass(bool enabled, int strengthPercent);
     // Output hardware-region setting and independent music-driver timing profile.
     // 0 = preserve recorded timing, 1 = Sonic 1-like VBlank,
     // 2 = Sonic 3K-like PAL compensation (approximate).
@@ -30,6 +33,7 @@ public:
     int region() const { return targetRate_; }
     bool isFinished() const {return finished_;}
     bool isPaused() const {return paused_;}
+    bool isPauseTailActive() const {return paused_ && pauseTailFrames_ > 0;}
     uint64_t position() const {return samples_;}
     static constexpr int Rate = 44100;
 private:
@@ -73,8 +77,15 @@ private:
     int sourceRate_=60, targetRate_=60, timingProfile_=0;
     bool sourceRateDeclared_=false;
     uint64_t samples_=0;
-    bool finished_=true, paused_=false, fading_=false, fadePause_=false;
+    bool finished_=true, paused_=false, fading_=false;
+    // While paused the VGM sequencer is frozen, but the YM2612 runs through
+    // a short natural release envelope, as on the console.
+    int pauseTailFrames_=0;
+    static constexpr int PauseTailFrames = Rate / 2;
     float psgGain_=1.f, fmGain_=1.f, dacGain_=1.f, masterGain_=1.f;
+    bool yamahaCombined_=false, analogLowpassEnabled_=false;
+    int lowpassStrength_=45;
+    float lowpassL_=0, lowpassR_=0;
     int fadeStep_=0, fadeCounter_=0;
     uint8_t registers_[2][256]{};
 };

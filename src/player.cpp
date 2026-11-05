@@ -30,12 +30,15 @@ static std::mutex songsMutex;
 static std::atomic<int> requested{-1}, current{-1};
 static std::atomic<bool> running{true}, pauseRequested{false}, pauseState{false};
 static std::atomic<bool> nextRequested{false}, prevRequested{false};
+static std::atomic<bool> combinedYamaha{false}, analogLowpass{false};
+static std::atomic<int> analogStrength{45};
+static HWND lowpassSlider{}, lowpassLabel{};
 static std::atomic<int> selectedRegion{60}; // 60Hz default preserves earlier playback for NTSC rips
 static std::atomic<int> selectedTimingProfile{0}; // preserve VGM timestamps by default
 static std::atomic<int> currentFileRate{60};
 static std::atomic<bool> currentFileRateDeclared{false};
 static std::thread audioThread;
-static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303;
+static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306;
 static const UINT WM_STATUS=WM_APP+10;
 
 static std::wstring appDirectory(){
@@ -95,6 +98,8 @@ static void audioWorker(){
   while(running){
     engine.setRegion(selectedRegion.load());
     engine.setTimingProfile(selectedTimingProfile.load());
+    engine.setYamahaCombined(combinedYamaha.load());
+    engine.setAnalogLowpass(analogLowpass.load(), analogStrength.load());
     if(nextRequested.exchange(false)){int i=current.load();int n;{std::lock_guard<std::mutex> lock(songsMutex);n=(int)songs.size();}
       if(n>0)requested=(i+1+n)%n;}
     if(prevRequested.exchange(false)){int i=current.load();int n;{std::lock_guard<std::mutex> lock(songsMutex);n=(int)songs.size();}
@@ -180,6 +185,17 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
         std::wstring value=std::to_wstring(volumePercent[i].load())+L" %";
         SetWindowTextW(percentHandles[i],value.c_str());
       }
+      CreateWindowW(L"BUTTON",L"Yamaha combined output (diagnostic: DAC follows FM)",
+                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,14,599,460,25,hwnd,
+                    (HMENU)CTRL_COMBINED,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Optional low-pass filter",
+                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,14,631,210,25,hwnd,
+                    (HMENU)CTRL_LOWPASS,nullptr,nullptr);
+      lowpassSlider=CreateWindowExW(0,TRACKBAR_CLASSW,L"",WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_NOTICKS,
+                    227,629,250,30,hwnd,(HMENU)CTRL_FILTER_STRENGTH,nullptr,nullptr);
+      SendMessageW(lowpassSlider,TBM_SETRANGE,TRUE,MAKELPARAM(5,95));
+      SendMessageW(lowpassSlider,TBM_SETPOS,TRUE,45);
+      lowpassLabel=CreateWindowW(L"STATIC",L"45 %",WS_CHILD|WS_VISIBLE,484,632,75,24,hwnd,nullptr,nullptr,nullptr);
       HFONT font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
       for(HWND h: {listHandle,statusHandle,GetDlgItem(hwnd,CTRL_OPEN),GetDlgItem(hwnd,CTRL_PREV),GetDlgItem(hwnd,CTRL_PLAY),GetDlgItem(hwnd,CTRL_NEXT)})
         SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
@@ -199,10 +215,18 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
         SetWindowTextW(percentHandles[i],label.c_str());
         break;
       }
+      if(source==lowpassSlider){
+        int value=(int)SendMessageW(lowpassSlider,TBM_GETPOS,0,0);
+        analogStrength=value;
+        std::wstring label=std::to_wstring(value)+L" %";
+        SetWindowTextW(lowpassLabel,label.c_str());
+      }
       return 0;
     }
     case WM_COMMAND:{
       int id=LOWORD(w);
+      if(id==CTRL_COMBINED)combinedYamaha=(SendMessageW(GetDlgItem(hwnd,CTRL_COMBINED),BM_GETCHECK,0,0)==BST_CHECKED);
+      if(id==CTRL_LOWPASS)analogLowpass=(SendMessageW(GetDlgItem(hwnd,CTRL_LOWPASS),BM_GETCHECK,0,0)==BST_CHECKED);
       if(id==CTRL_OPEN)openSong();
       if(id==CTRL_PROFILE && HIWORD(w)==CBN_SELCHANGE){
         const int profile=(int)SendMessageW(profileHandle,CB_GETCURSEL,0,0);
@@ -248,7 +272,7 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,LPWSTR,int show){
   wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
   if(!RegisterClassW(&wc))return 1;
   windowHandle=CreateWindowExW(0,wc.lpszClassName,L"Mega Drive Audio — Desktop Test",WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT,CW_USEDEFAULT,595,675,nullptr,nullptr,inst,nullptr);
+    CW_USEDEFAULT,CW_USEDEFAULT,595,720,nullptr,nullptr,inst,nullptr);
   if(!windowHandle)return 2;
   ShowWindow(windowHandle,show);UpdateWindow(windowHandle);
   audioThread=std::thread(audioWorker);

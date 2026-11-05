@@ -44,8 +44,8 @@ void MegaDriveEngine::reset() {
     psg_=PSG{}; psg_.clock=psgClock_;
     ymWrites_.clear(); ymWriteStage_=0; ymWriteDelay_=0; ymActive_={};
     std::memset(registers_,0,sizeof registers_);
-    clockFrac_=0; reconstructHead_=0; reconstruct_={}; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
-    fading_=paused_=fadePause_=false;fadeStep_=fadeCounter_=0;finished_=false;
+    clockFrac_=0; lowpassL_=lowpassR_=0; reconstructHead_=0; reconstruct_={}; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
+    fading_=paused_=false;pauseTailFrames_=0;fadeStep_=fadeCounter_=0;finished_=false;
 }
 bool MegaDriveEngine::load(const std::vector<uint8_t>& bytes,std::string& error) {
     finished_=true; vgm_=bytes;
@@ -111,25 +111,51 @@ void MegaDriveEngine::clockYMWrite() {
         ymWriteDelay_ = 2;
     }
 }
-void MegaDriveEngine::startFade(bool pause) {
+void MegaDriveEngine::startFade(bool /*pause*/) {
     if(finished_)return;
-    fading_=true;fadePause_=pause;fadeStep_=0;fadeCounter_=0;
+    fading_=true;fadeStep_=0;fadeCounter_=0;
     // Kill new DAC playback and PSG immediately; let FM decay through TL changes.
     writeYM(0,0x2b,0);
     for(int ch=0;ch<4;ch++)psg_.write((uint8_t)(0x90+(ch<<5)+15));
 }
 void MegaDriveEngine::requestFade(){startFade(false);}
-void MegaDriveEngine::requestPause(){if(!paused_&&!fading_)startFade(true);}
-void MegaDriveEngine::resume(){if(paused_){paused_=false;fading_=false;fadeStep_=0;
-        // Restore operator TLs, without re-keying held notes.
-        for(int p=0;p<2;p++)for(int a=0x40;a<=0x4f;a++)writeYM(p,(uint8_t)a,registers_[p][a]);
-    } else if(fading_&&fadePause_) {fading_=false;fadeStep_=0;}}
-void MegaDriveEngine::stop(){finished_=true;paused_=true;}
+void MegaDriveEngine::requestPause(){
+    if (finished_ || paused_ || fading_) return;
+    // Freeze VGM time immediately. We do NOT start the 4-second song fade.
+    // Natural YM envelopes must still be clocked for ~0.5 s after key-off;
+    // this preserves Nuked's YM2612 output including ladder characteristics.
+    paused_=true;
+    pauseTailFrames_=PauseTailFrames;
+    // Key-off all six FM channels (YM2612 channel codes: 0,1,2,4,5,6).
+    // These are delivered through the normal cycle-accurate write queue.
+    static constexpr uint8_t channels[6]={0,1,2,4,5,6};
+    for(uint8_t ch:channels)ymWrites_.push_back({0,0x28,ch});
+    // Stop PCM/DAC for the tail without changing the original VGM state.
+    // The original DAC enable register is restored on resume.
+    ymWrites_.push_back({0,0x2b,0});
+    // PSG has no envelope release: make its outputs silent immediately.
+    // A subsequent PSG volume command from the VGM can activate it again.
+    for(int ch=0;ch<4;ch++)psg_.vol[ch]=15;
+}
+void MegaDriveEngine::resume(){
+    if (!paused_) return;
+    paused_=false;
+    pauseTailFrames_=0;
+    // Reinstate the VGM's DAC configuration, not stale DAC samples.
+    ymWrites_.push_back({0,0x2b,registers_[0][0x2b]});
+    // Deliberately DO NOT key-on the interrupted FM notes or restore PSG
+    // volume: only subsequent VGM register events may trigger new notes.
+}
+void MegaDriveEngine::stop(){finished_=true;paused_=true;pauseTailFrames_=0;}
 void MegaDriveEngine::setVolumes(int psg, int fm, int dac, int master) {
     psgGain_=std::clamp(psg,0,200)/100.f;
     fmGain_=std::clamp(fm,0,200)/100.f;
     dacGain_=std::clamp(dac,0,200)/100.f;
     masterGain_=std::clamp(master,0,200)/100.f;
+}
+void MegaDriveEngine::setAnalogLowpass(bool enabled, int strengthPercent) {
+    analogLowpassEnabled_=enabled;
+    lowpassStrength_=std::clamp(strengthPercent,5,95);
 }
 void MegaDriveEngine::applyFade() {
     // 4.0 seconds: 240 steps at 60 updates/s. This is an adjustable
@@ -147,7 +173,7 @@ void MegaDriveEngine::applyFade() {
             ymWrites_.push_back({(uint8_t)port,(uint8_t)addr,v});
         }
     }
-    if(++fadeStep_>=kFadeSteps){fading_=false;if(fadePause_)paused_=true;else finished_=true;}
+    if(++fadeStep_>=kFadeSteps){fading_=false;finished_=true;}
 }
 void MegaDriveEngine::command() {
     if(cursor_>=vgm_.size()){finished_=true;return;}
@@ -229,7 +255,7 @@ static const std::array<float, 161>& reconstructionKernel() {
     return taps;
 }
 void MegaDriveEngine::sample(int16_t* output) {
-    if(paused_||finished_){output[0]=output[1]=0;return;}
+    if(finished_ || (paused_ && pauseTailFrames_<=0)){output[0]=output[1]=0;return;}
     static constexpr double ntscYm=7670454.0, palYm=7600489.0;
     const double ymScale=(targetRate_==sourceRate_)?1.0:
         (targetRate_==50?palYm/ntscYm:ntscYm/palYm);
@@ -270,11 +296,28 @@ void MegaDriveEngine::sample(int16_t* output) {
         if(--index<0)index=FirTaps-1;
     }
     psg_.clock=(double)psgClock_*psgScale;
-    const float psg=psg_.render()*psgGain_*.23f;
-    const float left=(bus[0]*fmGain_+bus[2]*dacGain_)*.77f;
-    const float right=(bus[1]*fmGain_+bus[3]*dacGain_)*.77f;
-    output[0]=(int16_t)clamp16((left+psg)*kOutputGain*masterGain_);
-    output[1]=(int16_t)clamp16((right+psg)*kOutputGain*masterGain_);
+    const float psg=(paused_?0.0f:psg_.render()*psgGain_*.23f);
+    // Both buses originate in the same Nuked YM2612 output. Combined mode
+    // uses a single gain for the full output and is the reference for checking
+    // whether our experimental DAC/FM split colors the sound.
+    const float left=(yamahaCombined_ ? (bus[0]+bus[2])*fmGain_
+                      : bus[0]*fmGain_+bus[2]*dacGain_)*.77f;
+    const float right=(yamahaCombined_ ? (bus[1]+bus[3])*fmGain_
+                       : bus[1]*fmGain_+bus[3]*dacGain_)*.77f;
+    float l=(left+psg)*kOutputGain*masterGain_;
+    float r=(right+psg)*kOutputGain*masterGain_;
+    // Optional output coloration, not the mandatory anti-alias filter above.
+    // One-pole RC low-pass with a bounded cutoff, sample-rate independent.
+    if (analogLowpassEnabled_) {
+        const float cutoff=18000.f - (lowpassStrength_/100.f)*15000.f;
+        const float alpha=1.f-std::exp(-2.f*3.14159265358979323846f*cutoff/Rate);
+        lowpassL_ += alpha*(l-lowpassL_);
+        lowpassR_ += alpha*(r-lowpassR_);
+        l=lowpassL_;r=lowpassR_;
+    } else { lowpassL_=l; lowpassR_=r; }
+    output[0]=(int16_t)clamp16(l);
+    output[1]=(int16_t)clamp16(r);
+    if(paused_ && pauseTailFrames_>0) --pauseTailFrames_;
 }
 void MegaDriveEngine::render(int16_t* dst,int frames){
     for(int i=0;i<frames;i++){tick();sample(dst+i*2);}
