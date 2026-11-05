@@ -44,7 +44,7 @@ void MegaDriveEngine::reset() {
     psg_=PSG{}; psg_.clock=psgClock_;
     ymWrites_.clear(); ymWriteStage_=0; ymWriteDelay_=0; ymActive_={};
     std::memset(registers_,0,sizeof registers_);
-    clockFrac_=0; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
+    clockFrac_=0; reconstructHead_=0; reconstruct_={}; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
     fading_=paused_=fadePause_=false;fadeStep_=fadeCounter_=0;finished_=false;
 }
 bool MegaDriveEngine::load(const std::vector<uint8_t>& bytes,std::string& error) {
@@ -68,11 +68,21 @@ bool MegaDriveEngine::load(const std::vector<uint8_t>& bytes,std::string& error)
 void MegaDriveEngine::setRegion(int hz) {
     if (hz!=50 && hz!=60) return;
     targetRate_=hz;
-    // The recorded chip clocks live in ymClock_/psgClock_. Only adjust
-    // by the small PAL/NTSC oscillator ratio, keeping the original register
-    // frequency/pitch rather than slowing an entire PCM audio buffer.
-    // Clock conversion is calculated in sample() using source/target ratio.
-    // Existing VGM event timing is scaled separately in tick().
+    // Hardware clock adjustment is kept separate from music-command timing.
+    // A file's 50/60 header is a hint; use original-timing mode if uncertain.
+}
+void MegaDriveEngine::setTimingProfile(int profile) {
+    if (profile>=0 && profile<=2) timingProfile_=profile;
+}
+double MegaDriveEngine::eventSpeed() const {
+    // The VGM header rate is a *hint* about the recording, not a
+    // guaranteed measurement of the actual source soundtrack's tempo.
+    // Original VGM mode is the safest general-purpose default.
+    if (timingProfile_==0 || targetRate_==sourceRate_) return 1.0;
+    // Sonic 1: 50 ticks / second where 60 were expected.
+    // Sonic 3K PAL: reported extra driver tick cycle yields ~58.33/60.
+    const double palRatio = timingProfile_==1 ? 5.0/6.0 : 35.0/36.0;
+    return targetRate_==50 ? palRatio : 1.0/palRatio;
 }
 void MegaDriveEngine::writeYM(int port,uint8_t address,uint8_t value) {
     registers_[port][address]=value;
@@ -181,10 +191,11 @@ void MegaDriveEngine::tickVgm(){
 }
 void MegaDriveEngine::tick(){
     if(paused_||finished_)return;
-    // VGM waits are 44.1 kHz source-time units. A 60 Hz recording played
-    // with 50 Hz timing advances the music sequence at 5/6 speed.
-    // Do not resample/pitch-shift the final mixed waveform.
-    eventFrac_ += (double)targetRate_ / (double)sourceRate_;
+    // VGM waits are 44.1 kHz source-time units. Only emulate changes in
+    // game-driver scheduling when explicitly requested: a 60 Hz VGM is NOT
+    // automatically Sonic 1-style PAL slowed-down music.
+    // Do not resample/pitch-shift the already mixed waveform.
+    eventFrac_ += eventSpeed();
     while(eventFrac_ >= 1.0 && !finished_) {
         eventFrac_ -= 1.0;
         tickVgm();
@@ -193,34 +204,75 @@ void MegaDriveEngine::tick(){
     if(fading_ && ++fadeCounter_>=735) {fadeCounter_=0;applyFade();}
     ++samples_;
 }
+// Reconstruct the multiplexed YM2612 output before downsampling.  The
+// previous engine averaged ~29 clock ticks directly into each 44.1kHz
+// sample, a boxcar filter with very poor stopband rejection.  YM2612 DAC
+// audio and some FM timbres therefore produced audible aliases.
+static const std::array<float, 161>& reconstructionKernel() {
+    static const auto taps=[] {
+        std::array<float, 161> f{};
+        // 19 kHz cutoff at 8*44.1kHz, Blackman window (high stopband rejection).
+        constexpr double pi=3.14159265358979323846;
+        constexpr double fc=19000.0/(44100.0*8.0);
+        constexpr int N=161;
+        double sum=0;
+        for(int n=0;n<N;n++) {
+            const double x=n-(N-1)*0.5;
+            const double h=(x==0.0)?2.0*fc:std::sin(2.0*pi*fc*x)/(pi*x);
+            const double w=0.42-0.5*std::cos(2.0*pi*n/(N-1))
+                             +0.08*std::cos(4.0*pi*n/(N-1));
+            f[n]=(float)(h*w); sum+=f[n];
+        }
+        for(float& a:f)a=(float)(a/sum);
+        return f;
+    }();
+    return taps;
+}
 void MegaDriveEngine::sample(int16_t* output) {
     if(paused_||finished_){output[0]=output[1]=0;return;}
     static constexpr double ntscYm=7670454.0, palYm=7600489.0;
     const double ymScale=(targetRate_==sourceRate_)?1.0:
         (targetRate_==50?palYm/ntscYm:ntscYm/palYm);
-    clockFrac_+= ((double)ymClock_*ymScale)/6.0/Rate;
-    int clocks=(int)clockFrac_;clockFrac_-=clocks;
-    // Nuked multiplexes FM and DAC on the same output pins.  For the
-    // YM2612 channel-6 DAC, OPN2_ChOutput selects DAC data on cycles 4..7.
-    // Split the rendered sample at that chip-internal cycle boundary so
-    // DAC and FM faders do not modify one another or the Nuked core.
-    int64_t fmLeft=0, fmRight=0, dacLeft=0, dacRight=0;
-    Bit16s b[2]{};
-    for(int i=0;i<clocks;i++){
-        clockYMWrite();
-        const bool dacSlot = ym_.dacen && ((ym_.cycles >> 2) == 1);
-        OPN2_Clock(&ym_,b);
-        if(dacSlot){ dacLeft+=b[0]; dacRight+=b[1]; }
-        else { fmLeft+=b[0]; fmRight+=b[1]; }
-    }
-    const float inv=clocks?1.f/(clocks*256.f):0.f;
     static constexpr double ntscPsg=3579545.0, palPsg=3546895.0;
     const double psgScale=(targetRate_==sourceRate_)?1.0:
         (targetRate_==50?palPsg/ntscPsg:ntscPsg/palPsg);
+
+    // Filter FM and DAC *separately* so their sliders remain independent.
+    // Each internal clock contributes to exactly one bus based on the
+    // Nuked output multiplexing slot (not the note's channel number).
+    for(int sub=0;sub<Oversample;sub++) {
+        clockFrac_+=((double)ymClock_*ymScale)/6.0/(Rate*Oversample);
+        const int clocks=(int)clockFrac_;clockFrac_-=clocks;
+        int64_t fmL=0,fmR=0,dacL=0,dacR=0;
+        Bit16s b[2]{};
+        for(int i=0;i<clocks;i++){
+            clockYMWrite();
+            const bool dacSlot=ym_.dacen && ((ym_.cycles>>2)==1);
+            OPN2_Clock(&ym_,b);
+            if(dacSlot){dacL+=b[0];dacR+=b[1];}
+            else {fmL+=b[0];fmR+=b[1];}
+        }
+        // The YM2612 output is a switched time-division signal. Missing
+        // DAC slots must contribute zero to DAC, not a held full DAC level.
+        const float inv=clocks?1.0f/(clocks*256.0f):0.0f;
+        reconstruct_[0][reconstructHead_]=(float)fmL*inv;
+        reconstruct_[1][reconstructHead_]=(float)fmR*inv;
+        reconstruct_[2][reconstructHead_]=(float)dacL*inv;
+        reconstruct_[3][reconstructHead_]=(float)dacR*inv;
+        reconstructHead_=(reconstructHead_+1)%FirTaps;
+    }
+    const auto& taps=reconstructionKernel();
+    float bus[4]{};
+    int index=(reconstructHead_+FirTaps-1)%FirTaps;
+    for(int i=0;i<FirTaps;i++){
+        const float a=taps[i];
+        for(int j=0;j<4;j++)bus[j]+=reconstruct_[j][index]*a;
+        if(--index<0)index=FirTaps-1;
+    }
     psg_.clock=(double)psgClock_*psgScale;
     const float psg=psg_.render()*psgGain_*.23f;
-    const float left=(fmLeft*fmGain_ + dacLeft*dacGain_)*inv*.77f;
-    const float right=(fmRight*fmGain_ + dacRight*dacGain_)*inv*.77f;
+    const float left=(bus[0]*fmGain_+bus[2]*dacGain_)*.77f;
+    const float right=(bus[1]*fmGain_+bus[3]*dacGain_)*.77f;
     output[0]=(int16_t)clamp16((left+psg)*kOutputGain*masterGain_);
     output[1]=(int16_t)clamp16((right+psg)*kOutputGain*masterGain_);
 }

@@ -1,43 +1,33 @@
-# Mega Drive Music Player v0.6 — PAL / NTSC + four-channel mixer
+# Mega Drive Music Player v0.8 — separate console region and music timing
 
-Windows C++ source using Nuked OPN2 (YM2612) and an experimental Sega PSG emulator.
+A Windows C++ VGM/VGZ player using Nuked OPN2. This version retains v0.7's 8x filtering, four volume sliders (PSG/FM/DAC/Master), and 4-second experimental hardware fade.
 
-## v0.6: Sonic 1 European PAL timing
+## New: independent controls above the track list
 
-- Visible **PAL 50 Hz** / **NTSC 60 Hz** radio buttons at the **top of the window** (default NTSC, preserving the previous player behaviour for NTSC rips).
-- Switch modes **during playback**. The VGM register-event timeline is converted using the rate at header offset `0x24`, when it contains 50 or 60 Hz.
-- A 60 Hz VGM played at PAL 50 Hz advances its *register event sequence* at **5/6 speed**. Therefore a 60-second source track takes approximately 72 seconds in PAL, like an original uncorrected 50 Hz Sonic 1 sound driver. The YM2612 and PSG continue rendering at the output sampling rate, with a small PAL-vs-NTSC hardware oscillator adjustment (~0.9%) rather than changing the pitch by 16.7%.
-- A file *already recorded at 50 Hz* plays unchanged in PAL mode (no double-slowdown); selecting NTSC speeds up its event timeline 6/5.
-- If the VGM rate is **zero or not 50/60**, the player clearly displays **"source unspecified (60Hz assumed)"** and uses 60 Hz as the fallback for its conversion. You need a correctly tagged source for reliable automatic conversion; some VGM rips do not specify their source rate.
-- The status line reports the current **playback region** and **file's declared source rate**.
-- **Limitation:** converting recorded register timings is a *compatibility approximation* for an uncorrected 50 Hz game. It cannot perfectly recreate game-specific PAL sound driver changes or convert every VGM into a genuine PAL hardware capture. In particular, files from games that already compensate for the PAL update rate should be played at their natural captured rate.
+**Region:** PAL 50 Hz / NTSC 60 Hz. This changes the approximate chip oscillator ratios when the selected output region differs from the source VGM header rate.
 
-## Existing features retained
+**Music timing:**
 
-- PSG, FM, DAC, Master independent volume sliders, 0–200%.
-- Mixer defaults: PSG 100%, **FM 160%**, DAC 100%, Master 100%.
-- 4.00-second FM operator-level fade when switching tracks or pausing (PSG and DAC mute immediately; this is not yet identical to Sonic 3K's native routine).
-- VGM/VGZ open, scrolling track list, Play/Pause, previous/next.
+- **Original VGM timing (default):** Does not modify stored VGM command waits, regardless of selected region. Safest and generally most faithful setting for soundtracks already recorded from game hardware.
+- **Sonic 1 — PAL 50Hz VBlank slowdown:** For an NTSC (60 Hz) recording played as PAL, advances the VGM events at **5/6 speed**, creating ~20% longer tracks. PAL-sourced files are NOT slowed again when playing in PAL. Selecting NTSC with a 50 Hz source uses 6/5 speed.
+- **Sonic 3 & Knuckles — PAL compensated (~97.2%):** For an NTSC recording played as PAL, advances events at **35/36 speed** (~97.22%). PAL-sourced tracks aren't slowed again; reverse conversion is applied for NTSC. This is a **driver-inspired approximation**, not a guaranteed bit-exact emulation of the exact original ROM/version's timing.
 
-## Build the Windows EXE on GitHub
+The 'source' status comes from the VGM header's 50/60 Hz hint at 0x24. It is not an authoritative claim about what the song's original game driver did. Files without a recognized rate are **assumed** to have 60 Hz source timing; inspect the source before applying a region conversion.
 
-1. Extract this ZIP **into the root** of your cloned `MegaDriveMusicPlayer` repository, replacing previous files. Preserve `.github/workflows/windows.yml` exactly as a nested folder/file.
-2. Commit and push in GitHub Desktop.
-3. Go to **Actions > Build Windows Player**. A push to `main` also triggers a build. Download `MegaDriveAudio-Windows-x64` from a successful run's **Artifacts**.
-4. Extract the artifact and run `MegaDriveAudio.exe`. Leave `unvgz.ps1` beside the EXE for VGZ loading.
+A VGM file contains timed hardware commands, not the original game's sound driver. No setting can reliably reverse-engineer arbitrary game-specific PAL optimizations. Use original VGM timing for unknown games and authentic PAL VGM recordings.
 
-Alternative: Visual Studio 2022 + CMake: `cmake -S . -B build -A x64` and `cmake --build build --config Release`.
+## Test and build
 
-## Verified locally
+- `test_profiles.cpp` checks the duration of all 12 source-region/profile combinations using synthetic VGM files.
+- `test_engine.cpp` is the existing engine smoke test; `test_fade.cpp` and `test_buses.cpp` test existing behavior.
+- C++ engine/profile tests were compiled and run locally on Linux. **The Windows GUI has not been compiled here**, because this environment does not include a Windows cross compiler. The bundled `.github/workflows/windows.yml` builds the Windows EXE through GitHub Actions.
 
-- The C++ audio engine builds and renders Sonic 3 & Knuckles Big Arms VGM for 20 seconds without clipping at the default mixer settings.
-- Synthetic rate-tagged VGMs were used to verify 60->50, 50->60, natural PAL and natural NTSC timing. A 44,100-sample / 1-second 60-Hz sequence plays for ~52,922 samples in PAL and ~44,101 in NTSC, with a one-sample scheduling boundary.
-- **The Windows GUI itself has not been compiled or run in this environment**; the GitHub Windows workflow is the required build verification.
+To update your repository, extract **the contents** of the ZIP to the root of your local `MegaDriveMusicPlayer` checkout, replacing existing files, then Commit and Push in GitHub Desktop. In GitHub Actions, use **Build Windows Player** and download the `MegaDriveAudio-Windows-x64` artifact. Keep `unvgz.ps1` alongside the EXE.
 
 ## Known limitations
 
-- PSG remains an experimental emulator; chip sound balance is not final.
-- VGM DAC streaming commands `0x90..0x95` are not implemented; traditional `0x80..0x8F` streams work.
-- Pause uses a fade rather than perfectly implementing Sonic game's original Start pause.
-- 200% gain combinations can clip; turn down Master if necessary.
-- Nuked OPN2 is LGPL 2.1+; see `NUKED-LGPL-2.1.txt`. Distributor responsibilities include sharing the library source and observing required library relinking conditions.
+- The PAL conversion is an approximation of game-driver timing, not a complete sound-driver emulator.
+- Source-rate metadata may be absent or inaccurate.
+- PSG, analog filtering, FM/DAC balance and certain VGM DAC streaming commands still require development and audio comparison to real hardware.
+- 4-second hardware fade is experimental and pause does not yet duplicate the original Sonic Start button exactly.
+- Nuked OPN2 is LGPL 2.1+; ensure library license and redistribution/relinking requirements are followed.

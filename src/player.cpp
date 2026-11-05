@@ -22,7 +22,7 @@
 #pragma comment(lib, "comctl32.lib")
 
 struct Song {std::wstring path, title;};
-static HWND windowHandle{}, listHandle{}, statusHandle{};
+static HWND windowHandle{}, listHandle{}, statusHandle{}, profileHandle{};
 static std::array<HWND,4> sliderHandles{}, percentHandles{};
 static std::array<std::atomic<int>,4> volumePercent{{100,160,100,100}}; // PSG, FM, DAC, Master
 static std::vector<Song> songs;
@@ -31,10 +31,11 @@ static std::atomic<int> requested{-1}, current{-1};
 static std::atomic<bool> running{true}, pauseRequested{false}, pauseState{false};
 static std::atomic<bool> nextRequested{false}, prevRequested{false};
 static std::atomic<int> selectedRegion{60}; // 60Hz default preserves earlier playback for NTSC rips
+static std::atomic<int> selectedTimingProfile{0}; // preserve VGM timestamps by default
 static std::atomic<int> currentFileRate{60};
 static std::atomic<bool> currentFileRateDeclared{false};
 static std::thread audioThread;
-static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302;
+static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303;
 static const UINT WM_STATUS=WM_APP+10;
 
 static std::wstring appDirectory(){
@@ -93,6 +94,7 @@ static void audioWorker(){
   int outputCount=0;
   while(running){
     engine.setRegion(selectedRegion.load());
+    engine.setTimingProfile(selectedTimingProfile.load());
     if(nextRequested.exchange(false)){int i=current.load();int n;{std::lock_guard<std::mutex> lock(songsMutex);n=(int)songs.size();}
       if(n>0)requested=(i+1+n)%n;}
     if(prevRequested.exchange(false)){int i=current.load();int n;{std::lock_guard<std::mutex> lock(songsMutex);n=(int)songs.size();}
@@ -110,6 +112,7 @@ static void audioWorker(){
       if(ok){std::vector<uint8_t> bytes;std::string error;
         if(readFile(song.path,bytes) && engine.load(bytes,error)){
           engine.setRegion(selectedRegion.load());
+          engine.setTimingProfile(selectedTimingProfile.load());
           currentFileRate=engine.sourceRate();currentFileRateDeclared=engine.sourceRateDeclared();
           loaded=true;current=pending;PostMessageW(windowHandle,WM_STATUS,1,0);}
         else {loaded=false;PostMessageW(windowHandle,WM_STATUS,3,0);}
@@ -146,19 +149,26 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       CreateWindowW(L"BUTTON",L"NTSC 60 Hz",WS_CHILD|WS_VISIBLE|BS_AUTORADIOBUTTON,
                     183,12,113,28,hwnd,(HMENU)CTRL_NTSC,nullptr,nullptr);
       SendMessageW(GetDlgItem(hwnd,CTRL_NTSC),BM_SETCHECK,BST_CHECKED,0);
+      CreateWindowW(L"STATIC",L"Music timing:",WS_CHILD|WS_VISIBLE,12,57,95,22,hwnd,nullptr,nullptr,nullptr);
+      profileHandle=CreateWindowW(WC_COMBOBOXW,L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+                          110,51,457,180,hwnd,(HMENU)CTRL_PROFILE,nullptr,nullptr);
+      SendMessageW(profileHandle,CB_ADDSTRING,0,(LPARAM)L"Original VGM timing (all games)");
+      SendMessageW(profileHandle,CB_ADDSTRING,0,(LPARAM)L"Sonic 1 - PAL 50Hz VBlank slowdown");
+      SendMessageW(profileHandle,CB_ADDSTRING,0,(LPARAM)L"Sonic 3 & Knuckles - PAL compensated (~97.2%)");
+      SendMessageW(profileHandle,CB_SETCURSEL,0,0);
       listHandle=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,
-        12,77,555,251,hwnd,(HMENU)CTRL_LIST,nullptr,nullptr);
+        12,105,555,251,hwnd,(HMENU)CTRL_LIST,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Open VGM / VGZ",WS_CHILD|WS_VISIBLE,415,10,152,31,hwnd,(HMENU)CTRL_OPEN,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L"<<",WS_CHILD|WS_VISIBLE,95,340,90,36,hwnd,(HMENU)CTRL_PREV,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,201,340,168,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L">>",WS_CHILD|WS_VISIBLE,384,340,90,36,hwnd,(HMENU)CTRL_NEXT,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"<<",WS_CHILD|WS_VISIBLE,95,368,90,36,hwnd,(HMENU)CTRL_PREV,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,201,368,168,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L">>",WS_CHILD|WS_VISIBLE,384,368,90,36,hwnd,(HMENU)CTRL_NEXT,nullptr,nullptr);
       statusHandle=CreateWindowW(L"STATIC",L"Select PAL or NTSC, then open a VGM/VGZ",WS_CHILD|WS_VISIBLE,
-        12,49,555,22,hwnd,nullptr,nullptr,nullptr);
+        12,83,555,20,hwnd,nullptr,nullptr,nullptr);
       // Four independent mix buses; 100% is the original v0.4 mix level.
       const wchar_t* names[]={L"PSG",L"FM",L"DAC",L"Master"};
       const int ids[]={CTRL_PSG,CTRL_FM,CTRL_DAC,CTRL_MASTER};
       for(int i=0;i<4;i++){
-        const int y=392+i*43;
+        const int y=420+i*43;
         CreateWindowW(L"STATIC",names[i],WS_CHILD|WS_VISIBLE,14,y+6,75,24,
                       hwnd,nullptr,nullptr,nullptr);
         sliderHandles[i]=CreateWindowExW(0,TRACKBAR_CLASSW,L"",WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_NOTICKS,
@@ -174,6 +184,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       for(HWND h: {listHandle,statusHandle,GetDlgItem(hwnd,CTRL_OPEN),GetDlgItem(hwnd,CTRL_PREV),GetDlgItem(hwnd,CTRL_PLAY),GetDlgItem(hwnd,CTRL_NEXT)})
         SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
       for(HWND h:percentHandles)SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
+      SendMessageW(profileHandle,WM_SETFONT,(WPARAM)font,TRUE);
       for(HWND h: {GetDlgItem(hwnd,CTRL_PAL),GetDlgItem(hwnd,CTRL_NTSC)})
         SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
 
@@ -193,6 +204,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
     case WM_COMMAND:{
       int id=LOWORD(w);
       if(id==CTRL_OPEN)openSong();
+      if(id==CTRL_PROFILE && HIWORD(w)==CBN_SELCHANGE){
+        const int profile=(int)SendMessageW(profileHandle,CB_GETCURSEL,0,0);
+        if(profile>=0 && profile<=2)selectedTimingProfile=profile;
+        PostMessageW(windowHandle,WM_STATUS,1,0);
+      }
       if(id==CTRL_PAL || id==CTRL_NTSC){
         selectedRegion=(id==CTRL_PAL ? 50 : 60);
         PostMessageW(windowHandle,WM_STATUS,1,0);
@@ -214,7 +230,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
           const std::wstring source=currentFileRateDeclared.load()?
               (L"source "+std::to_wstring(currentFileRate.load())+L"Hz"):
               L"source unspecified (60Hz assumed)";
-          showStatus(region+L" | "+source+L" | "+title);
+          const int profile=selectedTimingProfile.load();
+          const std::wstring timing=profile==0?L"VGM original timing":
+              (profile==1?L"Sonic 1 timing":L"Sonic 3K timing (approx.)");
+          showStatus(region+L" | "+timing+L" | "+source+L" | "+title);
           SendMessageW(listHandle,LB_SETCURSEL,i,0);
         }
       }
@@ -229,7 +248,7 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,LPWSTR,int show){
   wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
   if(!RegisterClassW(&wc))return 1;
   windowHandle=CreateWindowExW(0,wc.lpszClassName,L"Mega Drive Audio — Desktop Test",WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT,CW_USEDEFAULT,595,625,nullptr,nullptr,inst,nullptr);
+    CW_USEDEFAULT,CW_USEDEFAULT,595,675,nullptr,nullptr,inst,nullptr);
   if(!windowHandle)return 2;
   ShowWindow(windowHandle,show);UpdateWindow(windowHandle);
   audioThread=std::thread(audioWorker);

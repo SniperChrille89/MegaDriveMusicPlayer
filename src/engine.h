@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <vector>
 #include <deque>
+#include <array>
 #include <string>
 #include "ym3438.h"
 
@@ -16,7 +17,13 @@ public:
     void stop();
     // Gain percentages: 0 = mute, 100 = original v0.4 level, 200 = twice that level.
     void setVolumes(int psg, int fm, int dac, int master);
-    // Set 50 Hz (Europe) or 60 Hz (USA/Japan) timing profile.
+    // Output hardware-region setting and independent music-driver timing profile.
+    // 0 = preserve recorded timing, 1 = Sonic 1-like VBlank,
+    // 2 = Sonic 3K-like PAL compensation (approximate).
+    void setTimingProfile(int profile);
+    int timingProfile() const { return timingProfile_; }
+    double eventSpeed() const;
+    // Set 50 Hz (Europe) or 60 Hz (USA/Japan) hardware profile.
     void setRegion(int hz);
     int sourceRate() const { return sourceRate_; }
     bool sourceRateDeclared() const { return sourceRateDeclared_; }
@@ -55,9 +62,15 @@ private:
     std::vector<uint8_t> vgm_, pcm_;
     size_t cursor_=0, loop_=0, pcmIndex_=0;
     uint32_t wait_=0, ymClock_=7670454, psgClock_=3579545;
+    // 8x oversampled reconstruction, then a 161-tap windowed-sinc
+    // anti-aliasing filter before reducing to the 44.1 kHz output rate.
+    static constexpr int Oversample = 8;
+    static constexpr int FirTaps = 161;
+    std::array<std::array<float, FirTaps>, 4> reconstruct_{};
+    int reconstructHead_ = 0;
     double clockFrac_=0;
     double eventFrac_=0;
-    int sourceRate_=60, targetRate_=60;
+    int sourceRate_=60, targetRate_=60, timingProfile_=0;
     bool sourceRateDeclared_=false;
     uint64_t samples_=0;
     bool finished_=true, paused_=false, fading_=false, fadePause_=false;
