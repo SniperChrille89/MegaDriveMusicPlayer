@@ -13,7 +13,7 @@ add_executable(MegaDriveAudio WIN32
 target_compile_features(MegaDriveAudio PRIVATE cxx_std_17)
 target_include_directories(MegaDriveAudio PRIVATE src)
 target_compile_definitions(MegaDriveAudio PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(MegaDriveAudio PRIVATE winmm comdlg32 user32 gdi32 shell32)
+target_link_libraries(MegaDriveAudio PRIVATE winmm comdlg32 comctl32 user32 gdi32 shell32)
 if(MSVC)
     target_compile_options(MegaDriveAudio PRIVATE /W3 /utf-8)
 else()

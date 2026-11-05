@@ -14,6 +14,13 @@ public:
     void requestPause();
     void resume();
     void stop();
+    // Gain percentages: 0 = mute, 100 = original v0.4 level, 200 = twice that level.
+    void setVolumes(int psg, int fm, int dac, int master);
+    // Set 50 Hz (Europe) or 60 Hz (USA/Japan) timing profile.
+    void setRegion(int hz);
+    int sourceRate() const { return sourceRate_; }
+    bool sourceRateDeclared() const { return sourceRateDeclared_; }
+    int region() const { return targetRate_; }
     bool isFinished() const {return finished_;}
     bool isPaused() const {return paused_;}
     uint64_t position() const {return samples_;}
@@ -26,6 +33,7 @@ private:
     void startFade(bool pause);
     void applyFade();
     void tick();
+    void tickVgm();
     uint32_t u32(size_t index) const;
     uint16_t u16(size_t index) const;
     void sample(int16_t* output);
@@ -48,8 +56,12 @@ private:
     size_t cursor_=0, loop_=0, pcmIndex_=0;
     uint32_t wait_=0, ymClock_=7670454, psgClock_=3579545;
     double clockFrac_=0;
+    double eventFrac_=0;
+    int sourceRate_=60, targetRate_=60;
+    bool sourceRateDeclared_=false;
     uint64_t samples_=0;
     bool finished_=true, paused_=false, fading_=false, fadePause_=false;
+    float psgGain_=1.f, fmGain_=1.f, dacGain_=1.f, masterGain_=1.f;
     int fadeStep_=0, fadeCounter_=0;
     uint8_t registers_[2][256]{};
 };

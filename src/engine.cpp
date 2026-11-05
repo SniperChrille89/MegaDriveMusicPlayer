@@ -5,6 +5,8 @@
 #include <cstdio>
 
 static constexpr float levels[16] = {1,.794328f,.630957f,.501187f,.398107f,.316228f,.251189f,.199526f,.158489f,.125893f,.1f,.079433f,.063096f,.050119f,.039811f,0};
+static constexpr int kFadeSteps = 240; // 4.0 seconds at 60 fade updates per second
+static constexpr float kOutputGain = 42500.f; // original v0.4 level, sliders control each path
 static int clamp16(float v) { return (int)std::lround(std::max(-32768.f,std::min(32767.f,v))); }
 void MegaDriveEngine::PSG::write(uint8_t v) {
     if(v&0x80) {latch=(v>>4)&7; int ch=latch>>1;
@@ -42,7 +44,7 @@ void MegaDriveEngine::reset() {
     psg_=PSG{}; psg_.clock=psgClock_;
     ymWrites_.clear(); ymWriteStage_=0; ymWriteDelay_=0; ymActive_={};
     std::memset(registers_,0,sizeof registers_);
-    clockFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
+    clockFrac_=0; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
     fading_=paused_=fadePause_=false;fadeStep_=fadeCounter_=0;finished_=false;
 }
 bool MegaDriveEngine::load(const std::vector<uint8_t>& bytes,std::string& error) {
@@ -53,13 +55,31 @@ bool MegaDriveEngine::load(const std::vector<uint8_t>& bytes,std::string& error)
     if(cursor_>=vgm_.size()) {error="Invalid VGM data offset";return false;}
     ymClock_=u32(0x2c)&0x3fffffff;psgClock_=u32(0x0c)&0x3fffffff;
     if(!ymClock_)ymClock_=7670454;if(!psgClock_)psgClock_=3579545;
+    // VGM header 0x24: recording frame rate for tempo scaling.
+    // 0 means not specified: use 60Hz as a user-visible fallback, not as a fact.
+    const uint32_t recordedRate=u32(0x24);
+    sourceRateDeclared_=(recordedRate==50 || recordedRate==60);
+    sourceRate_=sourceRateDeclared_ ? (int)recordedRate : 60;
     const uint32_t loopOffset=u32(0x1c);
     loop_=loopOffset?0x1cull+loopOffset:0;
     if(loop_>=vgm_.size())loop_=0;
     reset();return true;
 }
+void MegaDriveEngine::setRegion(int hz) {
+    if (hz!=50 && hz!=60) return;
+    targetRate_=hz;
+    // The recorded chip clocks live in ymClock_/psgClock_. Only adjust
+    // by the small PAL/NTSC oscillator ratio, keeping the original register
+    // frequency/pitch rather than slowing an entire PCM audio buffer.
+    // Clock conversion is calculated in sample() using source/target ratio.
+    // Existing VGM event timing is scaled separately in tick().
+}
 void MegaDriveEngine::writeYM(int port,uint8_t address,uint8_t value) {
     registers_[port][address]=value;
+    // During hardware fade, keep the unfaded TL in the shadow registers.
+    // Subsequent fade ticks will write the attenuated carrier TL values.
+    // Never let an incoming VGM TL write momentarily restore full loudness.
+    if (fading_ && address >= 0x40 && address <= 0x4f) return;
     // TFI/VGM register data remain unmodified during ordinary playback.
     // Nuked OPN2 is clock-cycle accurate: writes must be serviced over time.
     // Sending address and data back-to-back overwrites write_data before the
@@ -95,9 +115,16 @@ void MegaDriveEngine::resume(){if(paused_){paused_=false;fading_=false;fadeStep_
         for(int p=0;p<2;p++)for(int a=0x40;a<=0x4f;a++)writeYM(p,(uint8_t)a,registers_[p][a]);
     } else if(fading_&&fadePause_) {fading_=false;fadeStep_=0;}}
 void MegaDriveEngine::stop(){finished_=true;paused_=true;}
+void MegaDriveEngine::setVolumes(int psg, int fm, int dac, int master) {
+    psgGain_=std::clamp(psg,0,200)/100.f;
+    fmGain_=std::clamp(fm,0,200)/100.f;
+    dacGain_=std::clamp(dac,0,200)/100.f;
+    masterGain_=std::clamp(master,0,200)/100.f;
+}
 void MegaDriveEngine::applyFade() {
-    // ~0.42 s, stepped in 60 Hz-equivalent increments; prototype, not SMPS exact.
-    const int addition=std::min(127,fadeStep_*5);
+    // 4.0 seconds: 240 steps at 60 updates/s. This is an adjustable
+    // approximation of the Sonic 3K fade duration, not a claimed exact SMPS curve.
+    const int addition=std::min(127,(fadeStep_*127 + kFadeSteps/2)/kFadeSteps);
     for(int port=0;port<2;port++)for(int ch=0;ch<3;ch++) {
         const uint8_t alg=registers_[port][0xb0+ch]&7;
         // YM2612 hardware operator slots: S1,S3,S2,S4 at offsets 0,4,8,12.
@@ -110,7 +137,7 @@ void MegaDriveEngine::applyFade() {
             ymWrites_.push_back({(uint8_t)port,(uint8_t)addr,v});
         }
     }
-    if(++fadeStep_>=26){fading_=false;if(fadePause_)paused_=true;else finished_=true;}
+    if(++fadeStep_>=kFadeSteps){fading_=false;if(fadePause_)paused_=true;else finished_=true;}
 }
 void MegaDriveEngine::command() {
     if(cursor_>=vgm_.size()){finished_=true;return;}
@@ -145,30 +172,57 @@ void MegaDriveEngine::command() {
         finished_=true;
     }
 }
-void MegaDriveEngine::tick(){
+void MegaDriveEngine::tickVgm(){
     if(paused_||finished_)return;
     int safety=0;
     while(!wait_&&!finished_&&++safety<20000)command();
     if(safety>=20000)finished_=true;
     if(wait_)--wait_;
+}
+void MegaDriveEngine::tick(){
+    if(paused_||finished_)return;
+    // VGM waits are 44.1 kHz source-time units. A 60 Hz recording played
+    // with 50 Hz timing advances the music sequence at 5/6 speed.
+    // Do not resample/pitch-shift the final mixed waveform.
+    eventFrac_ += (double)targetRate_ / (double)sourceRate_;
+    while(eventFrac_ >= 1.0 && !finished_) {
+        eventFrac_ -= 1.0;
+        tickVgm();
+    }
+    // Fade duration is always 4 real seconds independent of region.
     if(fading_ && ++fadeCounter_>=735) {fadeCounter_=0;applyFade();}
     ++samples_;
 }
 void MegaDriveEngine::sample(int16_t* output) {
     if(paused_||finished_){output[0]=output[1]=0;return;}
-    clockFrac_+= (double)ymClock_/6.0/Rate;
+    static constexpr double ntscYm=7670454.0, palYm=7600489.0;
+    const double ymScale=(targetRate_==sourceRate_)?1.0:
+        (targetRate_==50?palYm/ntscYm:ntscYm/palYm);
+    clockFrac_+= ((double)ymClock_*ymScale)/6.0/Rate;
     int clocks=(int)clockFrac_;clockFrac_-=clocks;
-    int64_t left=0,right=0;Bit16s b[2]{};
+    // Nuked multiplexes FM and DAC on the same output pins.  For the
+    // YM2612 channel-6 DAC, OPN2_ChOutput selects DAC data on cycles 4..7.
+    // Split the rendered sample at that chip-internal cycle boundary so
+    // DAC and FM faders do not modify one another or the Nuked core.
+    int64_t fmLeft=0, fmRight=0, dacLeft=0, dacRight=0;
+    Bit16s b[2]{};
     for(int i=0;i<clocks;i++){
         clockYMWrite();
+        const bool dacSlot = ym_.dacen && ((ym_.cycles >> 2) == 1);
         OPN2_Clock(&ym_,b);
-        left+=b[0];right+=b[1];
+        if(dacSlot){ dacLeft+=b[0]; dacRight+=b[1]; }
+        else { fmLeft+=b[0]; fmRight+=b[1]; }
     }
-    const float fmL=clocks?(float)left/clocks/256.f:0;
-    const float fmR=clocks?(float)right/clocks/256.f:0;
-    const float psg=psg_.render();
-    output[0]=(int16_t)clamp16((fmL*.77f+psg*.23f)*8500.f);
-    output[1]=(int16_t)clamp16((fmR*.77f+psg*.23f)*8500.f);
+    const float inv=clocks?1.f/(clocks*256.f):0.f;
+    static constexpr double ntscPsg=3579545.0, palPsg=3546895.0;
+    const double psgScale=(targetRate_==sourceRate_)?1.0:
+        (targetRate_==50?palPsg/ntscPsg:ntscPsg/palPsg);
+    psg_.clock=(double)psgClock_*psgScale;
+    const float psg=psg_.render()*psgGain_*.23f;
+    const float left=(fmLeft*fmGain_ + dacLeft*dacGain_)*inv*.77f;
+    const float right=(fmRight*fmGain_ + dacRight*dacGain_)*inv*.77f;
+    output[0]=(int16_t)clamp16((left+psg)*kOutputGain*masterGain_);
+    output[1]=(int16_t)clamp16((right+psg)*kOutputGain*masterGain_);
 }
 void MegaDriveEngine::render(int16_t* dst,int frames){
     for(int i=0;i<frames;i++){tick();sample(dst+i*2);}
