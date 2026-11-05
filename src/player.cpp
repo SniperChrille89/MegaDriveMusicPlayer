@@ -10,7 +10,9 @@
 #include <vector>
 #include <string>
 #include <fstream>
+#include <filesystem>
 #include <iterator>
+#include <cstring>
 #include <memory>
 #include "engine.h"
 #pragma comment(lib, "winmm.lib")
@@ -47,7 +49,7 @@ static bool decompressVGZ(const std::wstring& filename,std::wstring& out){
 static bool readFile(const std::wstring& filename,std::vector<uint8_t>& bytes){
   std::wstring p=filename,tmp;
   if(p.size()>=4 && _wcsicmp(p.c_str()+p.size()-4,L".vgz")==0){if(!decompressVGZ(p,tmp))return false;p=tmp;}
-  std::ifstream file(p,std::ios::binary);if(!file){if(!tmp.empty())DeleteFileW(tmp.c_str());return false;}
+  std::ifstream file(std::filesystem::path(p),std::ios::binary);if(!file){if(!tmp.empty())DeleteFileW(tmp.c_str());return false;}
   bytes.assign(std::istreambuf_iterator<char>(file),{});
   if(!tmp.empty())DeleteFileW(tmp.c_str());return !bytes.empty();
 }

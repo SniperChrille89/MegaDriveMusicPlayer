@@ -1,0 +1,32 @@
+name: Build Windows Player
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    name: Build Windows x64
+    runs-on: windows-2022
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+      - name: Configure with CMake
+        run: cmake -S . -B build -A x64
+      - name: Compile Release EXE
+        run: cmake --build build --config Release --parallel
+      - name: Package runnable application
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item 'build/Release/MegaDriveAudio.exe' 'dist/' -ErrorAction Stop
+          Copy-Item 'unvgz.ps1' 'dist/' -ErrorAction Stop
+          Copy-Item 'README.md' 'dist/' -ErrorAction Stop
+          Copy-Item 'NUKED-LGPL-2.1.txt' 'dist/' -ErrorAction Stop
+      - name: Upload EXE ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: MegaDriveAudio-Windows-x64
+          path: dist/
+          if-no-files-found: error

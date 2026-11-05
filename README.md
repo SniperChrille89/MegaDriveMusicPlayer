@@ -39,3 +39,21 @@ writes slightly. Do not assume this timing is perfectly accurate yet.
 
 The previous nine-second WAV is obsolete; use the newly exported `FM_fix_test.wav`
 for an updated comparison, remembering that its mix and volume remain experimental.
+
+## Fixed GitHub Actions setup (v0.2 build repair, 2026-11-05)
+
+The GitHub upload had `windows.yml` at repository root and **no `CMakeLists.txt`**, so GitHub could not recognize/build the Windows project. Two unrelated GitHub-generated templates (`.NET Core Desktop` and `C/C++ CI`) were trying to build nonexistent .NET / autotools projects.
+
+This corrected package now contains:
+
+- `.github/workflows/windows.yml` (proper GitHub Actions location)
+- `CMakeLists.txt` for Visual Studio 2022 and 64-bit Windows
+- `unvgz.ps1` required for loading VGZ files
+- `NUKED-LGPL-2.1.txt` with the bundled emulator's LGPL license
+- removes two unrelated failing Actions templates
+
+**To upload the corrected project to an existing GitHub repository**, replace the old files on the `main` branch and ensure `.github/workflows/windows.yml` is included; delete `.github/workflows/c-cpp.yml` and `.github/workflows/dotnet-desktop.yml` if still present. Then open GitHub Actions > Build Windows Player. The workflow should build and upload a downloadable `.exe` artifact. This Windows build has **not been run here**, so any platform-specific build issues may still need to be corrected.
+
+### Important limitations
+
+This source package includes a **first-pass PSG emulation**, not a hardware-verified SN76489 implementation. Nuked is cycle accurate but the app's FM scheduling and mixing are experimental. It does not yet support all VGM PCM stream commands. Hardware Fade and Pause are approximate. Do not confuse the current engine with a finished accurate emulator.
