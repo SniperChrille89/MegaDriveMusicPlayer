@@ -1,0 +1,20 @@
+name: Audio Hardware Engine tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/hardware/**'
+      - 'tests/**'
+      - 'CMakeLists.txt'
+      - '.github/workflows/emulator-tests.yml'
+jobs:
+  portable-bus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure portable bus
+        run: cmake -S . -B build-bus -DBUILD_TESTING=ON
+      - name: Compile
+        run: cmake --build build-bus --parallel
+      - name: Run tests
+        run: ctest --test-dir build-bus --output-on-failure
