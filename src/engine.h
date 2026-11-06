@@ -33,6 +33,7 @@ public:
     int region() const { return targetRate_; }
     bool isFinished() const {return finished_;}
     bool isPaused() const {return paused_;}
+    bool isFading() const {return fading_;}
     bool isPauseTailActive() const {return paused_ && pauseTailFrames_ > 0;}
     uint64_t position() const {return samples_;}
     uint64_t initialPrimeClocks() const {return initialYMPrimeClocks_;}

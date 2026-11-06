@@ -21,6 +21,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item 'build/Release/MegaDriveAudio.exe' 'dist/' -ErrorAction Stop
+          Copy-Item 'build/Release/mda_rom_probe.exe' 'dist/' -ErrorAction Stop
           Copy-Item 'unvgz.ps1' 'dist/' -ErrorAction Stop
           Copy-Item 'README.md' 'dist/' -ErrorAction Stop
           Copy-Item 'NUKED-LGPL-2.1.txt' 'dist/' -ErrorAction Stop

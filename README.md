@@ -1,3 +1,11 @@
+# Mega Drive Music Player v0.16
+
+**ROM-backed audio CPU foundation; Sonic SMPS driver playback is not implemented yet.**
+
+See [README_v016.md](README_v016.md) for verified changes and limitations.
+
+> **v0.15:** See [README_v015.md](README_v015.md) for the new Stop button, Sonic 3K-based fade cadence, testing and known audio limitations.
+
 # Mega Drive Music Player v0.10 — Yamaha diagnostic mode and optional low-pass filter
 
 This is a **test-focused update**, not yet a verified Genesis Plus GX-equivalent audio engine.

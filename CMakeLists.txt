@@ -9,10 +9,17 @@ if(BUILD_TESTING)
     add_executable(mda_test_bus tests/test_bus.cpp)
     target_link_libraries(mda_test_bus PRIVATE mda_audio_bus)
     add_test(NAME sound_bus COMMAND mda_test_bus)
+    add_executable(mda_test_rom_banking tests/test_rom_banking.cpp)
+    target_link_libraries(mda_test_rom_banking PRIVATE mda_audio_bus)
+    add_test(NAME rom_banking COMMAND mda_test_rom_banking)
     add_executable(mda_test_vgm_trace tests/test_vgm_trace.cpp)
     target_link_libraries(mda_test_vgm_trace PRIVATE mda_audio_bus)
     add_test(NAME cycle_trace_to_vgm COMMAND mda_test_vgm_trace)
 endif()
+
+add_executable(mda_rom_probe tools/rom_probe.cpp)
+target_link_libraries(mda_rom_probe PRIVATE mda_audio_bus)
+target_compile_features(mda_rom_probe PRIVATE cxx_std_17)
 
 # Optional, real Z80 execution module. Requires GitHub access at CMake configure time.
 # Kept OUT of the Windows GUI for now; driver-specific Sonic RAM/interrupts are unfinished.

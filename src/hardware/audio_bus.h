@@ -22,6 +22,12 @@ public:
     void setCycle(uint64_t cycle) { cycle_ = cycle; }
     uint64_t cycle() const { return cycle_; }
     void loadZ80(const uint8_t* source, size_t count, uint16_t start = 0);
+    // Game cartridge data is read-only and supplied by the user; no ROM included.
+    void loadRom(const uint8_t* source, size_t count);
+    size_t romSize() const { return rom_.size(); }
+    uint32_t z80BankBase() const { return uint32_t(bank_) << 15; }
+    uint8_t romRead(uint32_t address) const;
+    uint8_t z80RamRead(uint16_t addr) const { return ram_[addr & 0x1fff]; }
     uint8_t z80Read(uint16_t addr) const;
     void z80Write(uint16_t addr, uint8_t value);
     // 68000-side minimal sound ports. Not a full memory map.
@@ -35,6 +41,7 @@ private:
     void emit(Chip chip, uint16_t port, uint8_t value);
     std::array<uint8_t,8192> ram_{};
     std::array<uint8_t,4> ymPorts_{};
+    std::vector<uint8_t> rom_;
     std::vector<SoundWrite> trace_;
     WriteSink sink_;
     uint64_t cycle_=0;

@@ -5,7 +5,8 @@
 #include <cstdio>
 
 static constexpr float levels[16] = {1,.794328f,.630957f,.501187f,.398107f,.316228f,.251189f,.199526f,.158489f,.125893f,.1f,.079433f,.063096f,.050119f,.039811f,0};
-static constexpr int kFadeSteps = 240; // 4.0 seconds at 60 fade updates per second
+static constexpr int kFadeSteps = 40; // Sonic 3K: $28 (40) fade steps
+static constexpr int kSamplesPerFadeStep = 4410; // six 60 Hz ticks = 0.1 s at 44.1 kHz
 static constexpr float kOutputGain = 42500.f; // original v0.4 level, sliders control each path
 static int clamp16(float v) { return (int)std::lround(std::max(-32768.f,std::min(32767.f,v))); }
 void MegaDriveEngine::PSG::write(uint8_t v) {
@@ -135,7 +136,7 @@ void MegaDriveEngine::primeInitialYMRegisters() {
     }
 }
 void MegaDriveEngine::startFade(bool /*pause*/) {
-    if(finished_)return;
+    if(finished_ || fading_)return;
     fading_=true;fadeStep_=0;fadeCounter_=0;
     // Kill new DAC playback and PSG immediately; let FM decay through TL changes.
     writeYM(0,0x2b,0);
@@ -181,9 +182,11 @@ void MegaDriveEngine::setAnalogLowpass(bool enabled, int strengthPercent) {
     lowpassStrength_=std::clamp(strengthPercent,5,95);
 }
 void MegaDriveEngine::applyFade() {
-    // 4.0 seconds: 240 steps at 60 updates/s. This is an adjustable
-    // approximation of the Sonic 3K fade duration, not a claimed exact SMPS curve.
-    const int addition=std::min(127,(fadeStep_*127 + kFadeSteps/2)/kFadeSteps);
+    // Sonic 3K zFadeOutMusic initializes $28 steps, 6 music-driver ticks
+    // between each. zDoMusicFadeOut increases each FM track volume by 1
+    // before sending new carrier TL values. VGM lacks the Z80 track RAM,
+    // so this applies that +1 progression to the shadowed carrier TLs.
+    const int addition=fadeStep_+1;
     for(int port=0;port<2;port++)for(int ch=0;ch<3;ch++) {
         const uint8_t alg=registers_[port][0xb0+ch]&7;
         // YM2612 hardware operator slots: S1,S3,S2,S4 at offsets 0,4,8,12.
@@ -253,7 +256,7 @@ void MegaDriveEngine::tick(){
     // writes at timestamp zero. Later writes keep their genuine VGM waits.
     if(samples_ == 0) primeInitialYMRegisters();
     // Fade duration is always 4 real seconds independent of region.
-    if(fading_ && ++fadeCounter_>=735) {fadeCounter_=0;applyFade();}
+    if(fading_ && ++fadeCounter_>=kSamplesPerFadeStep) {fadeCounter_=0;applyFade();}
     ++samples_;
 }
 // Reconstruct the multiplexed YM2612 output before downsampling.  The

@@ -29,7 +29,7 @@ static std::vector<Song> songs;
 static std::mutex songsMutex;
 static std::atomic<int> requested{-1}, current{-1};
 static std::atomic<bool> running{true}, pauseRequested{false}, pauseState{false};
-static std::atomic<bool> nextRequested{false}, prevRequested{false};
+static std::atomic<bool> nextRequested{false}, prevRequested{false}, stopRequested{false};
 static std::atomic<bool> combinedYamaha{false}, analogLowpass{false};
 static std::atomic<int> analogStrength{45};
 static HWND lowpassSlider{}, lowpassLabel{};
@@ -38,7 +38,7 @@ static std::atomic<int> selectedTimingProfile{0}; // preserve VGM timestamps by 
 static std::atomic<int> currentFileRate{60};
 static std::atomic<bool> currentFileRateDeclared{false};
 static std::thread audioThread;
-static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306;
+static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_STOP=106,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306;
 static const UINT WM_STATUS=WM_APP+10;
 
 static std::wstring appDirectory(){
@@ -93,23 +93,37 @@ static void audioWorker(){
   Buffer buffers[kBuffers]{};
   for(auto& b:buffers){b.header.lpData=(LPSTR)b.data;b.header.dwBufferLength=sizeof b.data;
     waveOutPrepareHeader(wo,&b.header,sizeof(WAVEHDR));b.header.dwFlags|=WHDR_DONE;}
-  MegaDriveEngine engine;bool loaded=false;int pending=-1;bool fadingToNext=false;
+  MegaDriveEngine engine;bool loaded=false;int pending=-1;
   int outputCount=0;
   while(running){
     engine.setRegion(selectedRegion.load());
     engine.setTimingProfile(selectedTimingProfile.load());
     engine.setYamahaCombined(combinedYamaha.load());
     engine.setAnalogLowpass(analogLowpass.load(), analogStrength.load());
+    if(stopRequested.exchange(false)){
+      // Stop takes precedence over queued track changes. Allow current fade to
+      // finish, and leave the current selection available for Play/restart.
+      requested=-1; pending=-1; nextRequested=false; prevRequested=false;
+      if(loaded && !engine.isFinished()) {
+        if(engine.isPaused())engine.stop();
+        else engine.requestFade();
+      }
+      pauseState=false;
+    }
     if(nextRequested.exchange(false)){int i=current.load();int n;{std::lock_guard<std::mutex> lock(songsMutex);n=(int)songs.size();}
       if(n>0)requested=(i+1+n)%n;}
     if(prevRequested.exchange(false)){int i=current.load();int n;{std::lock_guard<std::mutex> lock(songsMutex);n=(int)songs.size();}
       if(n>0)requested=(i-1+n)%n;}
     int r=requested.exchange(-1);
-    if(r>=0 && r!=current){pending=r;
-      if(loaded && !engine.isFinished() && !engine.isPaused()){engine.requestFade();fadingToNext=true;}
-      else {fadingToNext=false;loaded=false;}
+    if(r>=0){pending=r;
+      if(loaded && !engine.isFinished() && !engine.isPaused())engine.requestFade();
+      else loaded=false; // no fade needed when already stopped/paused
     }
-    if(pauseRequested.exchange(false) && loaded){if(engine.isPaused())engine.resume();else engine.requestPause();}
+    if(pauseRequested.exchange(false) && loaded){
+      if(engine.isFinished())pending=current.load(); // Play after Stop restarts selected song
+      else if(engine.isPaused())engine.resume();
+      else if(!engine.isFading())engine.requestPause();
+    }
     pauseState=loaded&&engine.isPaused();
     if(pending>=0 && (!loaded || engine.isFinished())){
       Song song;bool ok=false;
@@ -122,7 +136,7 @@ static void audioWorker(){
           loaded=true;current=pending;PostMessageW(windowHandle,WM_STATUS,1,0);}
         else {loaded=false;PostMessageW(windowHandle,WM_STATUS,3,0);}
       }
-      pending=-1;fadingToNext=false;
+      pending=-1;
     }
     bool didWork=false;
     for(auto& b:buffers){
@@ -164,9 +178,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       listHandle=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,
         12,105,555,251,hwnd,(HMENU)CTRL_LIST,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Open VGM / VGZ",WS_CHILD|WS_VISIBLE,415,10,152,31,hwnd,(HMENU)CTRL_OPEN,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L"<<",WS_CHILD|WS_VISIBLE,95,368,90,36,hwnd,(HMENU)CTRL_PREV,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,201,368,168,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L">>",WS_CHILD|WS_VISIBLE,384,368,90,36,hwnd,(HMENU)CTRL_NEXT,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"<<",WS_CHILD|WS_VISIBLE,70,368,90,36,hwnd,(HMENU)CTRL_PREV,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,171,368,135,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE,317,368,85,36,hwnd,(HMENU)CTRL_STOP,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L">>",WS_CHILD|WS_VISIBLE,413,368,90,36,hwnd,(HMENU)CTRL_NEXT,nullptr,nullptr);
       statusHandle=CreateWindowW(L"STATIC",L"Select PAL or NTSC, then open a VGM/VGZ",WS_CHILD|WS_VISIBLE,
         12,83,555,20,hwnd,nullptr,nullptr,nullptr);
       // Four independent mix buses; 100% is the original v0.4 mix level.
@@ -197,7 +212,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       SendMessageW(lowpassSlider,TBM_SETPOS,TRUE,45);
       lowpassLabel=CreateWindowW(L"STATIC",L"45 %",WS_CHILD|WS_VISIBLE,484,632,75,24,hwnd,nullptr,nullptr,nullptr);
       HFONT font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-      for(HWND h: {listHandle,statusHandle,GetDlgItem(hwnd,CTRL_OPEN),GetDlgItem(hwnd,CTRL_PREV),GetDlgItem(hwnd,CTRL_PLAY),GetDlgItem(hwnd,CTRL_NEXT)})
+      for(HWND h: {listHandle,statusHandle,GetDlgItem(hwnd,CTRL_OPEN),GetDlgItem(hwnd,CTRL_PREV),GetDlgItem(hwnd,CTRL_PLAY),GetDlgItem(hwnd,CTRL_STOP),GetDlgItem(hwnd,CTRL_NEXT)})
         SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
       for(HWND h:percentHandles)SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
       SendMessageW(profileHandle,WM_SETFONT,(WPARAM)font,TRUE);
@@ -238,6 +253,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
         PostMessageW(windowHandle,WM_STATUS,1,0);
       }
       if(id==CTRL_PLAY)pauseRequested=true;
+      if(id==CTRL_STOP)stopRequested=true;
       if(id==CTRL_PREV)prevRequested=true;
       if(id==CTRL_NEXT)nextRequested=true;
       if(id==CTRL_LIST && HIWORD(w)==LBN_DBLCLK)requestSong((int)SendMessageW(listHandle,LB_GETCURSEL,0,0));
