@@ -1,4 +1,4 @@
-name: Audio Hardware Engine tests
+name: CPU Audio Engine (Z80)
 on:
   workflow_dispatch:
   push:
@@ -7,14 +7,29 @@ on:
       - 'tests/**'
       - 'CMakeLists.txt'
       - '.github/workflows/emulator-tests.yml'
+
 jobs:
-  portable-bus:
-    runs-on: ubuntu-latest
+  real-z80:
+    name: Real Z80 CPU -> audio bus -> VGM
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
-      - name: Configure portable bus
-        run: cmake -S . -B build-bus -DBUILD_TESTING=ON
-      - name: Compile
-        run: cmake --build build-bus --parallel
-      - name: Run tests
-        run: ctest --test-dir build-bus --output-on-failure
+      - name: Configure with real Z80 core
+        run: cmake -S . -B build-cpu -A x64 -DMDA_ENABLE_Z80=ON -DBUILD_TESTING=ON
+      - name: Compile CPU backend and VGM exporter
+        run: cmake --build build-cpu --config Release --parallel
+      - name: Run CPU and timing tests
+        run: ctest --test-dir build-cpu -C Release --output-on-failure
+      - name: Generate test soundtrack from Z80 machine code
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force cpu-demo | Out-Null
+          & './build-cpu/Release/mda_z80_generate_vgm.exe' 'cpu-demo/Z80_CPU_Demo.vgm'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item 'build-cpu/Release/mda_z80_generate_vgm.exe' cpu-demo/
+      - name: Upload Z80 driver demo
+        uses: actions/upload-artifact@v4
+        with:
+          name: Real-Z80-Audio-Demo
+          path: cpu-demo/
+          if-no-files-found: error

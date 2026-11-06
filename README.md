@@ -71,3 +71,20 @@ To update your repository, extract **the contents** of the ZIP to the root of yo
 - PSG, analog filtering, FM/DAC balance and certain VGM DAC streaming commands still require development and audio comparison to real hardware.
 - 4-second track-change hardware fade and 0.5-second Sonic-inspired pause tail are approximations; neither is claimed to be bit-identical to the original Sonic 3K driver.
 - Nuked OPN2 is LGPL 2.1+; ensure library license and redistribution/relinking requirements are followed.
+
+
+## v0.12 default mix
+
+Startup sliders now default to PSG 75%, FM 120%, DAC 110%, Master 100%. This is a UI preset change only; the unresolved FM/DAC distortion is **not** fixed.
+
+The Windows EXE still uses the VGM backend. The CPU/driver modules are not yet driving the player. Therefore the Big Arms VGM loop repeats recorded register events and cannot be expected to recreate progressive per-voice echo drift missing from those events. Do not artificially accumulate a delay.
+
+## v0.13 – VGM time-zero initialization
+
+Big Arms issues **326 YM2612 register writes at VGM time zero**, including instrument setup and initial key-ons. The previous engine queued these writes as if the song clock were already running; the Yamaha bus took several milliseconds to catch up, causing start-up note attacks to bunch together. v0.13 drains the time-zero Yamaha initialization into the Nuked chip *before producing the first PCM frame*, without advancing the musical VGM timeline. All later VGM waits remain unchanged. This is a first-stage repair; real hardware-cycle scheduling and DAC accuracy still need full comparison against Genesis Plus GX.
+
+The standalone startup test can be compiled on Linux using `g++` with `src/engine.cpp` and `src/ym3438.c` and run on an uncompressed VGM. The four mix sliders remain **PSG 75 / FM 120 / DAC 110 / Master 100**. Pause, PAL/NTSC profiles, four-second fade, and experimental CPU modules are retained.
+
+## v0.14 experimental CPU-driven audio backend
+
+See [README_CPU_ENGINE.md](README_CPU_ENGINE.md). The existing playable Windows EXE is preserved. New GitHub workflow `CPU Audio Engine (Z80)` separately tests real Z80 execution into the sound bus and generates a small `Z80_CPU_Demo.vgm`. This is not yet the Sonic SMPS sound driver or a replacement for the VGM playback frontend.

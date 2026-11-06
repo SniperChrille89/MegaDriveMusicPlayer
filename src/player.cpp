@@ -24,7 +24,7 @@
 struct Song {std::wstring path, title;};
 static HWND windowHandle{}, listHandle{}, statusHandle{}, profileHandle{};
 static std::array<HWND,4> sliderHandles{}, percentHandles{};
-static std::array<std::atomic<int>,4> volumePercent{{100,160,100,100}}; // PSG, FM, DAC, Master
+static std::array<std::atomic<int>,4> volumePercent{{75,120,110,100}}; // PSG, FM, DAC, Master: user-tested defaults
 static std::vector<Song> songs;
 static std::mutex songsMutex;
 static std::atomic<int> requested{-1}, current{-1};

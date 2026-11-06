@@ -26,7 +26,8 @@ void SoundBus::z80Write(uint16_t a, uint8_t v) {
     if (a < 0x4000) {ram_[a & 0x1fff]=v; return;}
     if (a >= 0x4000 && a < 0x6000) {ymPorts_[a & 3]=v; emit(Chip::YM2612,a & 3,v); return;}
     if (a >= 0x6000 && a < 0x6100) {bank_=uint16_t((bank_ >> 1) | ((v & 1) << 8)); return;}
-    // PSG is memory-mapped on the 68k side, not on the Z80 YM port range.
+    // The Mega Drive Z80 can also reach the PSG through the VDP's $7F11 port.
+    if ((a & 0xff00) == 0x7f00 && (a & 0x1f) == 0x11) { emit(Chip::PSG,0,v); return; }
 }
 void SoundBus::m68kWrite8(uint32_t a, uint8_t v) {
     a &= 0xffffff;

@@ -43,6 +43,7 @@ void MegaDriveEngine::reset() {
     OPN2_Reset(&ym_);
     psg_=PSG{}; psg_.clock=psgClock_;
     ymWrites_.clear(); ymWriteStage_=0; ymWriteDelay_=0; ymActive_={};
+    initialYMPrimeClocks_=0; initialYMPrimeWrites_=0; initialYMPrimed_=false;
     std::memset(registers_,0,sizeof registers_);
     clockFrac_=0; lowpassL_=lowpassR_=0; reconstructHead_=0; reconstruct_={}; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
     fading_=paused_=false;pauseTailFrames_=0;fadeStep_=fadeCounter_=0;finished_=false;
@@ -109,6 +110,28 @@ void MegaDriveEngine::clockYMWrite() {
         OPN2_Write(&ym_,ymActive_.port ? 2 : 0,ymActive_.address);
         ymWriteStage_ = 1;
         ymWriteDelay_ = 2;
+    }
+}
+// VGM's time-zero register burst is conceptually an initial chip state, not
+// hundreds of musical events that should consume the first few milliseconds.
+// Big Arms has 326 YM writes at VGM sample 0. Serializing those writes into
+// the normal realtime output produces a many-millisecond backlog, compressing
+// the first FM note attacks together. Preclock them once, *without* advancing
+// the VGM timeline or emitting PCM. Subsequent timed writes stay queued.
+// This is a compatibility workaround for VGM's zero-time initialization,
+// not a full replacement for a cycle-scheduled real-hardware bus.
+void MegaDriveEngine::primeInitialYMRegisters() {
+    if(initialYMPrimed_)return;
+    initialYMPrimed_=true;
+    initialYMPrimeWrites_=(int)ymWrites_.size();
+    // Cap protects a malformed file from an unbounded startup delay.
+    constexpr uint64_t MaxPrimeClocks=100000;
+    Bit16s discarded[2]{};
+    while((!ymWrites_.empty() || ymWriteStage_ || ymWriteDelay_) &&
+          initialYMPrimeClocks_<MaxPrimeClocks) {
+        clockYMWrite();
+        OPN2_Clock(&ym_,discarded);
+        ++initialYMPrimeClocks_;
     }
 }
 void MegaDriveEngine::startFade(bool /*pause*/) {
@@ -226,6 +249,9 @@ void MegaDriveEngine::tick(){
         eventFrac_ -= 1.0;
         tickVgm();
     }
+    // Before the first PCM sample, initialize the YM state from all VGM
+    // writes at timestamp zero. Later writes keep their genuine VGM waits.
+    if(samples_ == 0) primeInitialYMRegisters();
     // Fade duration is always 4 real seconds independent of region.
     if(fading_ && ++fadeCounter_>=735) {fadeCounter_=0;applyFade();}
     ++samples_;

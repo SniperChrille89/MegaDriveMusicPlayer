@@ -35,11 +35,15 @@ public:
     bool isPaused() const {return paused_;}
     bool isPauseTailActive() const {return paused_ && pauseTailFrames_ > 0;}
     uint64_t position() const {return samples_;}
+    uint64_t initialPrimeClocks() const {return initialYMPrimeClocks_;}
+    int initialPrimeWrites() const {return initialYMPrimeWrites_;}
+    bool initialPrimed() const {return initialYMPrimed_;}
     static constexpr int Rate = 44100;
 private:
     void reset();
     void writeYM(int port,uint8_t address,uint8_t value);
     void clockYMWrite();
+    void primeInitialYMRegisters();
     void command();
     void startFade(bool pause);
     void applyFade();
@@ -60,6 +64,9 @@ private:
     ym3438_t ym_{};
     struct YMWrite { uint8_t port, address, value; };
     std::deque<YMWrite> ymWrites_;
+    uint64_t initialYMPrimeClocks_ = 0;
+    int initialYMPrimeWrites_ = 0;
+    bool initialYMPrimed_ = false;
     int ymWriteStage_ = 0; // 0 = address, 1 = data
     int ymWriteDelay_ = 0; // number of clocks between writes
     YMWrite ymActive_{};
