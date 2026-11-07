@@ -13,7 +13,7 @@ jobs:
       - name: Check out project
         uses: actions/checkout@v4
       - name: Configure with CMake
-        run: cmake -S . -B build -A x64
+        run: cmake -S . -B build -A x64 -DMDA_ENABLE_Z80=ON
       - name: Compile Release EXE
         run: cmake --build build --config Release --parallel
       - name: Run portable unit tests

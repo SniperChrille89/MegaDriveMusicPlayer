@@ -16,17 +16,28 @@
 #include <iterator>
 #include <cstring>
 #include <memory>
+#include <future>
+#include <chrono>
+#include <algorithm>
+#include <map>
+#include <cmath>
+#ifdef MDA_ROM_AUDIO_ENABLED
+#include "hardware/rom_audio.h"
+#endif
 #include "engine.h"
 #include "hardware/rom_catalog.h"
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 
-struct Song {std::wstring path, title;};
-static HWND windowHandle{}, listHandle{}, statusHandle{}, profileHandle{};
+struct Song {std::wstring path, title; bool fromRom=false; uint8_t musicId=0;};
+static HWND windowHandle{}, listHandle{}, statusHandle{}, profileHandle{}, timelineHandle{}, timelineInfoHandle{};
 static mda::RomCatalog openedCatalog;
 static std::vector<mda::RomTrack> romTracks;
 static bool romListMode=false;
+static std::atomic<bool> romModeActive{false};
+static std::shared_ptr<const std::vector<uint8_t>> openedRom;
+static std::mutex romMutex;
 static std::wstring romTitle;
 static std::array<HWND,4> sliderHandles{}, percentHandles{};
 static std::array<std::atomic<int>,4> volumePercent{{75,120,110,100}}; // PSG, FM, DAC, Master: user-tested defaults
@@ -45,6 +56,104 @@ static std::atomic<bool> currentFileRateDeclared{false};
 static std::thread audioThread;
 static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_STOP=106,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306,CTRL_OPEN_ROM=307,CTRL_ROM_LIST=308;
 static const UINT WM_STATUS=WM_APP+10;
+static const UINT WM_SEEK_TO=WM_APP+12;
+static constexpr int kTimelineHeight=37;
+static std::atomic<uint64_t> playPosition{0}, playDuration{0}, playLoopStart{UINT64_MAX};
+static std::atomic<uint64_t> seekRequested{UINT64_MAX};
+static std::atomic<bool> seekBusy{false};
+static bool timelineDragging=false;
+static int timelineDragX=0;
+static uint32_t readLe32(const std::vector<uint8_t>& b,size_t off) {
+  if(off+4>b.size())return 0;
+  return uint32_t(b[off])|(uint32_t(b[off+1])<<8)|(uint32_t(b[off+2])<<16)|(uint32_t(b[off+3])<<24);
+}
+// VGM's loop offset points to a COMMAND, not a timestamp. Sum preceding waits.
+// A ROM-generated trace has no loop offset and is deliberately reported as unknown.
+static uint64_t vgmLoopSample(const std::vector<uint8_t>& b) {
+  if(b.size()<0x40 || std::memcmp(b.data(),"Vgm ",4)!=0)return UINT64_MAX;
+  const uint32_t off=readLe32(b,0x1c);
+  if(!off)return UINT64_MAX;
+  const uint64_t end=uint64_t(0x1c)+off;
+  size_t p=readLe32(b,8)>=0x150?(readLe32(b,0x34)?size_t(0x34)+readLe32(b,0x34):0x40):0x40;
+  if(end>=b.size() || end<p)return UINT64_MAX;
+  uint64_t samples=0;
+  while(p<end){
+    const uint8_t op=b[p++];
+    if(op==0x61){if(p+2>b.size())break;samples+=b[p]|(uint16_t(b[p+1])<<8);p+=2;}
+    else if(op==0x62)samples+=735;
+    else if(op==0x63)samples+=882;
+    else if(op>=0x70&&op<=0x7f)samples+=(op&15)+1;
+    else if(op>=0x80&&op<=0x8f)samples+=(op&15);
+    else if(op==0x50 || op==0x4f || (op>=0x30&&op<=0x3f))p+=1;
+    else if((op>=0x51&&op<=0x5f)||(op>=0xa0&&op<=0xbf))p+=2;
+    else if(op>=0xc0&&op<=0xdf)p+=3;
+    else if(op==0x67){if(p+6>b.size() || b[p]!=0x66)break;p+=2;const auto len=readLe32(b,p);p+=4+len;}
+    else if(op==0xe0)p+=4;
+    else if(op==0x66)break;
+    else break;
+    if(p>b.size())break;
+  }
+  return p==end?samples:UINT64_MAX;
+}
+static std::wstring clockText(uint64_t sample){
+  const uint64_t sec=sample/MegaDriveEngine::Rate;
+  wchar_t buf[48]{};swprintf_s(buf,L"%02llu:%02llu",(unsigned long long)(sec/60),(unsigned long long)(sec%60));
+  return buf;
+}
+static int timelineX(uint64_t sample,uint64_t duration,int width){
+  const int a=16,b=std::max(a+1,width-16);
+  if(!duration)return a;
+  return a+(int)(double(std::min(sample,duration))/double(duration)*(b-a));
+}
+static uint64_t timelineSample(int x,uint64_t duration,int width){
+  const int a=16,b=std::max(a+1,width-16);
+  return (uint64_t)(std::clamp(double(x-a)/double(b-a),0.0,1.0)*double(duration));
+}
+static LRESULT CALLBACK timelineProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
+  switch(msg){
+    case WM_ERASEBKGND:return 1;
+    case WM_LBUTTONDOWN:case WM_MOUSEMOVE:case WM_LBUTTONUP:{
+      if(msg==WM_LBUTTONDOWN){timelineDragging=true;SetCapture(hwnd);}
+      if(!timelineDragging)return 0;
+      RECT rc{};GetClientRect(hwnd,&rc);
+      timelineDragX=(short)LOWORD(l);
+      InvalidateRect(hwnd,nullptr,FALSE);
+      if(msg==WM_LBUTTONUP){
+        timelineDragging=false;ReleaseCapture();
+        const auto dur=playDuration.load();
+        if(dur>0)PostMessageW(GetParent(hwnd),WM_SEEK_TO,0,(LPARAM)timelineSample(timelineDragX,dur,rc.right));
+      }
+      return 0;
+    }
+    case WM_CAPTURECHANGED:timelineDragging=false;InvalidateRect(hwnd,nullptr,FALSE);return 0;
+    case WM_PAINT:{
+      PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);
+      RECT rc{};GetClientRect(hwnd,&rc);
+      HBRUSH bg=CreateSolidBrush(RGB(245,245,245));FillRect(dc,&rc,bg);DeleteObject(bg);
+      const int y=19,xa=16,xb=std::max(xa+1,rc.right-16);
+      HPEN rail=CreatePen(PS_SOLID,5,RGB(195,200,205));HPEN old=(HPEN)SelectObject(dc,rail);
+      MoveToEx(dc,xa,y,nullptr);LineTo(dc,xb,y);
+      SelectObject(dc,old);DeleteObject(rail);
+      const uint64_t duration=playDuration.load();
+      if(duration){
+        const uint64_t pos=timelineDragging?timelineSample(timelineDragX,duration,rc.right):playPosition.load();
+        const int x=timelineX(pos,duration,rc.right);
+        HPEN played=CreatePen(PS_SOLID,5,RGB(64,125,180));old=(HPEN)SelectObject(dc,played);
+        MoveToEx(dc,xa,y,nullptr);LineTo(dc,x,y);SelectObject(dc,old);DeleteObject(played);
+        const uint64_t loop=playLoopStart.load();
+        if(loop!=UINT64_MAX && loop<duration){
+          int lx=timelineX(loop,duration,rc.right);
+          HPEN mark=CreatePen(PS_SOLID,2,RGB(110,85,175));old=(HPEN)SelectObject(dc,mark);
+          MoveToEx(dc,lx,5,nullptr);LineTo(dc,lx,34);SelectObject(dc,old);DeleteObject(mark);
+        }
+        HBRUSH thumb=CreateSolidBrush(RGB(35,90,145));HBRUSH prior=(HBRUSH)SelectObject(dc,thumb);
+        Ellipse(dc,x-6,y-6,x+7,y+7);SelectObject(dc,prior);DeleteObject(thumb);
+      }
+      EndPaint(hwnd,&ps);return 0;
+    }
+  }
+  return DefWindowProcW(hwnd,msg,w,l);
+}
 
 static std::wstring appDirectory(){
   wchar_t buf[MAX_PATH]{}; GetModuleFileNameW(nullptr,buf,MAX_PATH);
@@ -71,7 +180,7 @@ static bool readFile(const std::wstring& filename,std::vector<uint8_t>& bytes){
   if(!tmp.empty())DeleteFileW(tmp.c_str());return !bytes.empty();
 }
 static void showStatus(const std::wstring& str){SetWindowTextW(statusHandle,str.c_str());}
-static void requestSong(int i){ if(romListMode)return; if(i>=0){requested=i;pauseRequested=false;PostMessageW(windowHandle,WM_STATUS,0,0);} }
+static void requestSong(int i){ if(i>=0){requested=i;pauseRequested=false;PostMessageW(windowHandle,WM_STATUS,0,0);} }
 static void openSong(){
   wchar_t filename[32768]{};
   OPENFILENAMEW ofn{};ofn.lStructSize=sizeof ofn;ofn.hwndOwner=windowHandle;
@@ -117,6 +226,8 @@ static void openRom(){
     requested=-1;
     pauseRequested=false;
     romListMode=true;
+    romModeActive=true;
+    {std::lock_guard<std::mutex> lock(romMutex);openedRom=std::make_shared<const std::vector<uint8_t>>(std::move(bytes));}
     openedCatalog=std::move(inspected);
     romTracks=openedCatalog.tracks;
     romTitle=widenAscii(openedCatalog.overseasTitle);
@@ -128,11 +239,15 @@ static void openRom(){
     SendMessageW(listHandle,LB_RESETCONTENT,0,0);
     for(const auto& track:romTracks){
         const std::wstring label=widenAscii(track.label);
+        {std::lock_guard<std::mutex> lock(songsMutex);songs.push_back({L"",label,true,track.command});}
         SendMessageW(listHandle,LB_ADDSTRING,0,(LPARAM)label.c_str());
     }
     if(!romTracks.empty())SendMessageW(listHandle,LB_SETCURSEL,0,0);
-    showStatus(L"ROM: "+romTitle+L" | "+widenAscii(openedCatalog.profile)+
-        L" | TRACK CATALOG ONLY (ROM driver playback not connected)");
+#ifdef MDA_ROM_AUDIO_ENABLED
+    showStatus(L"ROM: "+romTitle+L" | Select song and press Play (Z80 rendering in memory)");
+#else
+    showStatus(L"ROM: "+romTitle+L" | ROM audio disabled in this build");
+#endif
     SetWindowTextW(GetDlgItem(windowHandle,CTRL_OPEN_ROM),L"Open ROM");
 }
 static void showRomPending(){
@@ -158,6 +273,17 @@ static void audioWorker(){
   for(auto& b:buffers){b.header.lpData=(LPSTR)b.data;b.header.dwBufferLength=sizeof b.data;
     waveOutPrepareHeader(wo,&b.header,sizeof(WAVEHDR));b.header.dwFlags|=WHDR_DONE;}
   MegaDriveEngine engine;bool loaded=false;int pending=-1;
+#ifdef MDA_ROM_AUDIO_ENABLED
+  std::future<mda::RomAudioResult> romJob;
+  bool romJobRunning=false;
+  int romJobIndex=-1;
+  int romJobRegion=50;
+#endif
+  // Checkpoints preserve the complete YM/PSG/PCM state and make seeking
+  // back to already-played segments fast without approximating chip envelopes.
+  std::map<uint64_t,MegaDriveEngine> checkpoints;
+  std::vector<uint8_t> loadedVgm;
+  uint64_t lastCheckpoint=0;
   int outputCount=0;
   while(running){
     engine.setRegion(selectedRegion.load());
@@ -189,18 +315,89 @@ static void audioWorker(){
       else if(!engine.isFading())engine.requestPause();
     }
     pauseState=loaded&&engine.isPaused();
+#ifdef MDA_ROM_AUDIO_ENABLED
+    if(romJobRunning && romJob.wait_for(std::chrono::milliseconds(0))==std::future_status::ready){
+      auto result=romJob.get();romJobRunning=false;
+      // Discard a stale result when a different song/mode was requested.
+      if(romJobIndex==pending && romModeActive.load() && !result.vgm.empty()){
+        std::string error;
+        if(engine.load(result.vgm,error)){
+          engine.setRegion(romJobRegion);engine.setTimingProfile(0);
+          currentFileRate=romJobRegion;currentFileRateDeclared=true;
+          loaded=true;current=pending;pending=-1;
+          loadedVgm=result.vgm;checkpoints.clear();checkpoints.emplace(0,engine);
+          lastCheckpoint=0;playPosition=0;
+          playDuration=uint64_t(readLe32(result.vgm,0x18));
+          playLoopStart=UINT64_MAX;
+          PostMessageW(windowHandle,WM_STATUS,4,0);
+        }else {loaded=false;pending=-1;PostMessageW(windowHandle,WM_STATUS,3,0);}
+      }else if(romJobIndex==pending && romModeActive.load()){
+        loaded=false;pending=-1;PostMessageW(windowHandle,WM_STATUS,5,0);
+      }
+    }
+#endif
     if(pending>=0 && (!loaded || engine.isFinished())){
       Song song;bool ok=false;
       {std::lock_guard<std::mutex> lock(songsMutex);if(pending<(int)songs.size()){song=songs[pending];ok=true;}}
-      if(ok){std::vector<uint8_t> bytes;std::string error;
+      if(ok){
+#ifdef MDA_ROM_AUDIO_ENABLED
+        if(song.fromRom){
+          if(!romJobRunning){
+            std::shared_ptr<const std::vector<uint8_t>> rom;
+            {std::lock_guard<std::mutex> lock(romMutex);rom=openedRom;}
+            if(rom){
+              romJobIndex=pending;romJobRegion=selectedRegion.load();
+              auto id=song.musicId;auto hz=romJobRegion;
+              romJob=std::async(std::launch::async,[rom,id,hz]{return mda::renderSonic3KRom(*rom,id,60,hz);});
+              romJobRunning=true;
+              PostMessageW(windowHandle,WM_STATUS,6,0);
+            }else {pending=-1;PostMessageW(windowHandle,WM_STATUS,5,0);}
+          }
+        } else
+#endif
+        {std::vector<uint8_t> bytes;std::string error;
         if(readFile(song.path,bytes) && engine.load(bytes,error)){
           engine.setRegion(selectedRegion.load());
           engine.setTimingProfile(selectedTimingProfile.load());
           currentFileRate=engine.sourceRate();currentFileRateDeclared=engine.sourceRateDeclared();
-          loaded=true;current=pending;PostMessageW(windowHandle,WM_STATUS,1,0);}
+          loaded=true;current=pending;
+          loadedVgm=bytes;checkpoints.clear();checkpoints.emplace(0,engine);
+          lastCheckpoint=0;playPosition=0;
+          playDuration=uint64_t(readLe32(bytes,0x18));
+          playLoopStart=vgmLoopSample(bytes);
+          PostMessageW(windowHandle,WM_STATUS,1,0);}
         else {loaded=false;PostMessageW(windowHandle,WM_STATUS,3,0);}
+        pending=-1;
+        }
       }
-      pending=-1;
+      else pending=-1;
+    }
+    const uint64_t seek=seekRequested.exchange(UINT64_MAX);
+    if(seek!=UINT64_MAX && loaded && !loadedVgm.empty() && playDuration.load()){
+      seekBusy=true;
+      // Remove queued sound so audio does not briefly play the old position.
+      waveOutReset(wo);
+      for(auto& b:buffers)b.header.dwFlags|=WHDR_DONE;
+      const bool wasPaused=engine.isPaused();
+      const uint64_t target=std::min(seek,playDuration.load()-1);
+      // Locate the most recent valid chip-state snapshot. Forward seeks into
+      // unplayed territory are exact but may need some time to synthesize.
+      auto it=checkpoints.upper_bound(target);
+      if(it!=checkpoints.begin())--it;
+      if(it!=checkpoints.end())engine=it->second;
+      else {std::string err;engine.load(loadedVgm,err);}
+      std::array<int16_t,4096> discard{};
+      while(engine.position()<target && !engine.isFinished() && running){
+        const int step=(int)std::min<uint64_t>(2048,target-engine.position());
+        engine.render(discard.data(),step);
+        if(engine.position()/MegaDriveEngine::Rate/5>lastCheckpoint/5){
+          const auto second=engine.position()/MegaDriveEngine::Rate;
+          checkpoints[engine.position()]=engine;lastCheckpoint=second;
+        }
+      }
+      if(wasPaused)engine.requestPause();
+      playPosition=engine.position();seekBusy=false;
+      PostMessageW(windowHandle,WM_STATUS,7,0);
     }
     bool didWork=false;
     for(auto& b:buffers){
@@ -209,6 +406,11 @@ static void audioWorker(){
         engine.setVolumes(volumePercent[0].load(),volumePercent[1].load(),
                           volumePercent[2].load(),volumePercent[3].load());
         engine.render(b.data,kFrames);
+        playPosition=engine.position();
+        const uint64_t sec=engine.position()/MegaDriveEngine::Rate;
+        if(sec>=lastCheckpoint+5){
+          checkpoints.emplace(engine.position(),engine);lastCheckpoint=sec;
+        }
       }
       else memset(b.data,0,sizeof b.data);
       b.header.dwBufferLength=sizeof b.data;
@@ -240,20 +442,25 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       SendMessageW(profileHandle,CB_ADDSTRING,0,(LPARAM)L"Sonic 3 & Knuckles - PAL compensated (~97.2%)");
       SendMessageW(profileHandle,CB_SETCURSEL,0,0);
       listHandle=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,
-        12,105,555,251,hwnd,(HMENU)CTRL_LIST,nullptr,nullptr);
+        12,105,555,213,hwnd,(HMENU)CTRL_LIST,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Open VGM / VGZ",WS_CHILD|WS_VISIBLE,415,10,152,31,hwnd,(HMENU)CTRL_OPEN,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Open ROM",WS_CHILD|WS_VISIBLE,302,10,110,31,hwnd,(HMENU)CTRL_OPEN_ROM,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L"<<",WS_CHILD|WS_VISIBLE,70,368,90,36,hwnd,(HMENU)CTRL_PREV,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,171,368,135,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE,317,368,85,36,hwnd,(HMENU)CTRL_STOP,nullptr,nullptr);
-      CreateWindowW(L"BUTTON",L">>",WS_CHILD|WS_VISIBLE,413,368,90,36,hwnd,(HMENU)CTRL_NEXT,nullptr,nullptr);
+      timelineInfoHandle=CreateWindowW(L"STATIC",L"Intro  |  Loop: unknown                                  00:00 / 00:00",
+        WS_CHILD|WS_VISIBLE,14,321,550,19,hwnd,nullptr,nullptr,nullptr);
+      timelineHandle=CreateWindowW(L"MDA_TIMELINE",L"",WS_CHILD|WS_VISIBLE,
+        12,339,555,kTimelineHeight,hwnd,nullptr,nullptr,nullptr);
+      SetTimer(hwnd,1,200,nullptr);
+      CreateWindowW(L"BUTTON",L"<<",WS_CHILD|WS_VISIBLE,70,388,90,36,hwnd,(HMENU)CTRL_PREV,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,171,388,135,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE,317,388,85,36,hwnd,(HMENU)CTRL_STOP,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L">>",WS_CHILD|WS_VISIBLE,413,388,90,36,hwnd,(HMENU)CTRL_NEXT,nullptr,nullptr);
       statusHandle=CreateWindowW(L"STATIC",L"Select PAL or NTSC, then open a VGM/VGZ",WS_CHILD|WS_VISIBLE,
         12,83,555,20,hwnd,nullptr,nullptr,nullptr);
       // Four independent mix buses; 100% is the original v0.4 mix level.
       const wchar_t* names[]={L"PSG",L"FM",L"DAC",L"Master"};
       const int ids[]={CTRL_PSG,CTRL_FM,CTRL_DAC,CTRL_MASTER};
       for(int i=0;i<4;i++){
-        const int y=420+i*43;
+        const int y=440+i*43;
         CreateWindowW(L"STATIC",names[i],WS_CHILD|WS_VISIBLE,14,y+6,75,24,
                       hwnd,nullptr,nullptr,nullptr);
         sliderHandles[i]=CreateWindowExW(0,TRACKBAR_CLASSW,L"",WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_NOTICKS,
@@ -266,24 +473,41 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
         SetWindowTextW(percentHandles[i],value.c_str());
       }
       CreateWindowW(L"BUTTON",L"Yamaha combined output (diagnostic: DAC follows FM)",
-                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,14,599,460,25,hwnd,
+                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,14,619,460,25,hwnd,
                     (HMENU)CTRL_COMBINED,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Optional low-pass filter",
-                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,14,631,210,25,hwnd,
+                    WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,14,651,210,25,hwnd,
                     (HMENU)CTRL_LOWPASS,nullptr,nullptr);
       lowpassSlider=CreateWindowExW(0,TRACKBAR_CLASSW,L"",WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_NOTICKS,
-                    227,629,250,30,hwnd,(HMENU)CTRL_FILTER_STRENGTH,nullptr,nullptr);
+                    227,649,250,30,hwnd,(HMENU)CTRL_FILTER_STRENGTH,nullptr,nullptr);
       SendMessageW(lowpassSlider,TBM_SETRANGE,TRUE,MAKELPARAM(5,95));
       SendMessageW(lowpassSlider,TBM_SETPOS,TRUE,45);
-      lowpassLabel=CreateWindowW(L"STATIC",L"45 %",WS_CHILD|WS_VISIBLE,484,632,75,24,hwnd,nullptr,nullptr,nullptr);
+      lowpassLabel=CreateWindowW(L"STATIC",L"45 %",WS_CHILD|WS_VISIBLE,484,652,75,24,hwnd,nullptr,nullptr,nullptr);
       HFONT font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
       for(HWND h: {listHandle,statusHandle,GetDlgItem(hwnd,CTRL_OPEN),GetDlgItem(hwnd,CTRL_OPEN_ROM),GetDlgItem(hwnd,CTRL_PREV),GetDlgItem(hwnd,CTRL_PLAY),GetDlgItem(hwnd,CTRL_STOP),GetDlgItem(hwnd,CTRL_NEXT)})
         SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
       for(HWND h:percentHandles)SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
       SendMessageW(profileHandle,WM_SETFONT,(WPARAM)font,TRUE);
+      SendMessageW(timelineInfoHandle,WM_SETFONT,(WPARAM)font,TRUE);
       for(HWND h: {GetDlgItem(hwnd,CTRL_PAL),GetDlgItem(hwnd,CTRL_NTSC)})
         SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
 
+      return 0;
+    }
+    case WM_TIMER:{
+      if(w==1){
+        const uint64_t pos=playPosition.load(),dur=playDuration.load(),loop=playLoopStart.load();
+        std::wstring info=L"Intro   |   ";
+        info+=(loop!=UINT64_MAX?L"Loop @ "+clockText(loop):L"Loop: not identified");
+        info+=L"                  "+clockText(pos)+L" / "+clockText(dur);
+        if(seekBusy.load())info+=L"  (seeking...)";
+        SetWindowTextW(timelineInfoHandle,info.c_str());
+        InvalidateRect(timelineHandle,nullptr,FALSE);
+      }
+      return 0;
+    }
+    case WM_SEEK_TO:{
+      if(playDuration.load()>0){seekRequested=uint64_t(l);}
       return 0;
     }
     case WM_HSCROLL:{
@@ -318,16 +542,41 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
         selectedRegion=(id==CTRL_PAL ? 50 : 60);
         PostMessageW(windowHandle,WM_STATUS,1,0);
       }
-      if(id==CTRL_PLAY){if(romListMode)showRomPending();else pauseRequested=true;}
-      if(id==CTRL_STOP && !romListMode)stopRequested=true;
-      if(id==CTRL_PREV){if(romListMode){int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);if(i>0)SendMessageW(listHandle,LB_SETCURSEL,i-1,0);}else prevRequested=true;}
-      if(id==CTRL_NEXT){if(romListMode){int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);if(i+1<(int)romTracks.size())SendMessageW(listHandle,LB_SETCURSEL,i+1,0);}else nextRequested=true;}
-      if(id==CTRL_LIST && HIWORD(w)==LBN_DBLCLK){if(romListMode)showRomPending();else requestSong((int)SendMessageW(listHandle,LB_GETCURSEL,0,0));}
+      if(id==CTRL_PLAY){
+        if(romListMode){
+#ifdef MDA_ROM_AUDIO_ENABLED
+          int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);
+          if(i>=0 && current.load()!=i) requestSong(i);
+          else if(i>=0 && current.load()==i) pauseRequested=true;
+#else
+          showRomPending();
+#endif
+        }else pauseRequested=true;
+      }
+      if(id==CTRL_STOP)stopRequested=true;
+      if(id==CTRL_PREV){if(romListMode){int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);int n=(int)romTracks.size();if(n>0){i=(i-1+n)%n;SendMessageW(listHandle,LB_SETCURSEL,i,0);requestSong(i);}}else prevRequested=true;}
+      if(id==CTRL_NEXT){if(romListMode){int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);int n=(int)romTracks.size();if(n>0){i=(i+1)%n;SendMessageW(listHandle,LB_SETCURSEL,i,0);requestSong(i);}}else nextRequested=true;}
+      if(id==CTRL_LIST && HIWORD(w)==LBN_DBLCLK){
+#ifdef MDA_ROM_AUDIO_ENABLED
+        requestSong((int)SendMessageW(listHandle,LB_GETCURSEL,0,0));
+#else
+        if(romListMode)showRomPending();else requestSong((int)SendMessageW(listHandle,LB_GETCURSEL,0,0));
+#endif
+      }
       return 0;
     }
     case WM_STATUS:{
       if(romListMode){
-        showStatus(L"ROM: "+romTitle+L" | "+widenAscii(openedCatalog.profile)+L" | catalog only (audio driver pending)");
+        if(w==6)showStatus(L"ROM: Preparing original Z80 music in memory (60 seconds)...");
+        else if(w==5)showStatus(L"ROM: Z80 driver could not generate sound for this selection");
+        else if(w==3)showStatus(L"ROM: Failed to initialize audio engine");
+        else if(w==4 || w==1){
+          int i=current.load();
+          if(i>=0 && i<(int)romTracks.size()){
+            showStatus(L"ROM playback: "+widenAscii(romTracks[i].label)+L" | "+(selectedRegion.load()==50?L"PAL":L"NTSC")+L" | 60-second driver trace");
+            SendMessageW(listHandle,LB_SETCURSEL,i,0);
+          }
+        }
         return 0;
       }
       if(w==2)showStatus(L"Could not open Windows audio output");
@@ -349,7 +598,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       }
       return 0;
     }
-    case WM_DESTROY:running=false;PostQuitMessage(0);return 0;
+    case WM_DESTROY:KillTimer(hwnd,1);running=false;PostQuitMessage(0);return 0;
   }
   return DefWindowProcW(hwnd,msg,w,l);
 }
@@ -357,8 +606,12 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,LPWSTR,int show){
   WNDCLASSW wc{};wc.lpfnWndProc=wndProc;wc.hInstance=inst;wc.lpszClassName=L"MegaDriveAudioPlayerClass";
   wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
   if(!RegisterClassW(&wc))return 1;
+  WNDCLASSW timeline{};timeline.lpfnWndProc=timelineProc;timeline.hInstance=inst;
+  timeline.lpszClassName=L"MDA_TIMELINE";timeline.hCursor=LoadCursor(nullptr,IDC_HAND);
+  timeline.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
+  if(!RegisterClassW(&timeline))return 3;
   windowHandle=CreateWindowExW(0,wc.lpszClassName,L"Mega Drive Audio — Desktop Test",WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT,CW_USEDEFAULT,595,720,nullptr,nullptr,inst,nullptr);
+    CW_USEDEFAULT,CW_USEDEFAULT,595,750,nullptr,nullptr,inst,nullptr);
   if(!windowHandle)return 2;
   ShowWindow(windowHandle,show);UpdateWindow(windowHandle);
   audioThread=std::thread(audioWorker);
