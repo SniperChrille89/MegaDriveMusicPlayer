@@ -1,3 +1,7 @@
+# v0.17 ROM catalog milestone
+
+See [README_v017.md](README_v017.md) for scope, tests and limitations.
+
 # Mega Drive Music Player v0.16
 
 **ROM-backed audio CPU foundation; Sonic SMPS driver playback is not implemented yet.**

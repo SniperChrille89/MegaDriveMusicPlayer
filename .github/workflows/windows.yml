@@ -16,6 +16,8 @@ jobs:
         run: cmake -S . -B build -A x64
       - name: Compile Release EXE
         run: cmake --build build --config Release --parallel
+      - name: Run portable unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
       - name: Package runnable application
         shell: pwsh
         run: |

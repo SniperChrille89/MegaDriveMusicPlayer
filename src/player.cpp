@@ -17,12 +17,15 @@
 #include <cstring>
 #include <memory>
 #include "engine.h"
+#include "hardware/rom_catalog.h"
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 
 struct Song {std::wstring path, title;};
 static HWND windowHandle{}, listHandle{}, statusHandle{}, profileHandle{};
+static HWND romDialog{},romList{},romText{};
+static mda::RomCatalog openedCatalog;
 static std::array<HWND,4> sliderHandles{}, percentHandles{};
 static std::array<std::atomic<int>,4> volumePercent{{75,120,110,100}}; // PSG, FM, DAC, Master: user-tested defaults
 static std::vector<Song> songs;
@@ -38,7 +41,7 @@ static std::atomic<int> selectedTimingProfile{0}; // preserve VGM timestamps by 
 static std::atomic<int> currentFileRate{60};
 static std::atomic<bool> currentFileRateDeclared{false};
 static std::thread audioThread;
-static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_STOP=106,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306;
+static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_STOP=106,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306,CTRL_OPEN_ROM=307,CTRL_ROM_LIST=308;
 static const UINT WM_STATUS=WM_APP+10;
 
 static std::wstring appDirectory(){
@@ -81,6 +84,66 @@ static void openSong(){
   SendMessageW(listHandle,LB_ADDSTRING,0,(LPARAM)title.c_str());
   SendMessageW(listHandle,LB_SETCURSEL,idx,0);
   requestSong(idx);
+}
+static std::wstring widenAscii(const std::string& text){
+    return std::wstring(text.begin(),text.end());
+}
+static LRESULT CALLBACK romWndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
+    if(msg==WM_CREATE){
+        romText=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_LEFT,
+            12,12,545,64,hwnd,nullptr,nullptr,nullptr);
+        romList=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",
+            WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,
+            12,82,545,355,hwnd,(HMENU)(INT_PTR)CTRL_ROM_LIST,nullptr,nullptr);
+        auto font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        SendMessageW(romText,WM_SETFONT,(WPARAM)font,TRUE);
+        SendMessageW(romList,WM_SETFONT,(WPARAM)font,TRUE);
+        return 0;
+    }
+    if(msg==WM_COMMAND && LOWORD(w)==CTRL_ROM_LIST && HIWORD(w)==LBN_DBLCLK){
+        MessageBoxW(hwnd,
+           L"ROM and music command identified.\n\nOriginal Z80 / 68000 sound-driver execution is NOT connected to this player yet.\nThe track will not play until that emulator stage is implemented.",
+           L"Original driver playback pending",MB_OK|MB_ICONINFORMATION);
+        return 0;
+    }
+    if(msg==WM_CLOSE){DestroyWindow(hwnd);return 0;}
+    if(msg==WM_DESTROY){romDialog=nullptr;romList=nullptr;romText=nullptr;return 0;}
+    return DefWindowProcW(hwnd,msg,w,l);
+}
+static void openRom(){
+    wchar_t filename[32768]{};
+    OPENFILENAMEW ofn{};ofn.lStructSize=sizeof ofn;ofn.hwndOwner=windowHandle;
+    ofn.lpstrFilter=L"Mega Drive ROM (*.bin;*.md)\0*.bin;*.md\0All files\0*.*\0\0";
+    ofn.lpstrFile=filename;ofn.nMaxFile=32768;
+    ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_HIDEREADONLY;
+    if(!GetOpenFileNameW(&ofn))return;
+    std::ifstream file(std::filesystem::path(filename),std::ios::binary);
+    std::vector<uint8_t> bytes;
+    if(file)bytes.assign(std::istreambuf_iterator<char>(file),{});
+    openedCatalog=mda::inspectRom(bytes);
+    if(!openedCatalog.valid){
+        std::wstring err=L"ROM could not be recognized: "+widenAscii(openedCatalog.error);
+        MessageBoxW(windowHandle,err.c_str(),L"Invalid ROM",MB_OK|MB_ICONWARNING);return;
+    }
+    if(romDialog){DestroyWindow(romDialog);romDialog=nullptr;}
+    WNDCLASSW wc{};wc.lpfnWndProc=romWndProc;wc.hInstance=GetModuleHandleW(nullptr);
+    wc.lpszClassName=L"MegaDriveRomCatalogClass";
+    wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
+    wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
+    RegisterClassW(&wc);
+    romDialog=CreateWindowExW(0,wc.lpszClassName,L"ROM music catalog (preview)",
+        WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,580,500,
+        windowHandle,nullptr,wc.hInstance,nullptr);
+    if(!romDialog)return;
+    std::wstring text=L"ROM: "+widenAscii(openedCatalog.overseasTitle)+
+       L"\nRegion: "+widenAscii(openedCatalog.region)+L" | "+
+       widenAscii(openedCatalog.profile)+L"\nCOMMAND LIST ONLY — CPU-driven audio not yet implemented.";
+    SetWindowTextW(romText,text.c_str());
+    for(auto& track:openedCatalog.tracks){
+        auto wlabel=widenAscii(track.label);
+        SendMessageW(romList,LB_ADDSTRING,0,(LPARAM)wlabel.c_str());
+    }
+    ShowWindow(romDialog,SW_SHOW);UpdateWindow(romDialog);
 }
 static void audioWorker(){
   WAVEFORMATEX fmt{};fmt.wFormatTag=WAVE_FORMAT_PCM;fmt.nChannels=2;fmt.nSamplesPerSec=MegaDriveEngine::Rate;
@@ -178,6 +241,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       listHandle=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY,
         12,105,555,251,hwnd,(HMENU)CTRL_LIST,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Open VGM / VGZ",WS_CHILD|WS_VISIBLE,415,10,152,31,hwnd,(HMENU)CTRL_OPEN,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Open ROM (preview)",WS_CHILD|WS_VISIBLE,302,10,110,31,hwnd,(HMENU)CTRL_OPEN_ROM,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"<<",WS_CHILD|WS_VISIBLE,70,368,90,36,hwnd,(HMENU)CTRL_PREV,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,171,368,135,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE,317,368,85,36,hwnd,(HMENU)CTRL_STOP,nullptr,nullptr);
@@ -212,7 +276,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       SendMessageW(lowpassSlider,TBM_SETPOS,TRUE,45);
       lowpassLabel=CreateWindowW(L"STATIC",L"45 %",WS_CHILD|WS_VISIBLE,484,632,75,24,hwnd,nullptr,nullptr,nullptr);
       HFONT font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-      for(HWND h: {listHandle,statusHandle,GetDlgItem(hwnd,CTRL_OPEN),GetDlgItem(hwnd,CTRL_PREV),GetDlgItem(hwnd,CTRL_PLAY),GetDlgItem(hwnd,CTRL_STOP),GetDlgItem(hwnd,CTRL_NEXT)})
+      for(HWND h: {listHandle,statusHandle,GetDlgItem(hwnd,CTRL_OPEN),GetDlgItem(hwnd,CTRL_OPEN_ROM),GetDlgItem(hwnd,CTRL_PREV),GetDlgItem(hwnd,CTRL_PLAY),GetDlgItem(hwnd,CTRL_STOP),GetDlgItem(hwnd,CTRL_NEXT)})
         SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
       for(HWND h:percentHandles)SendMessageW(h,WM_SETFONT,(WPARAM)font,TRUE);
       SendMessageW(profileHandle,WM_SETFONT,(WPARAM)font,TRUE);
@@ -243,6 +307,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       if(id==CTRL_COMBINED)combinedYamaha=(SendMessageW(GetDlgItem(hwnd,CTRL_COMBINED),BM_GETCHECK,0,0)==BST_CHECKED);
       if(id==CTRL_LOWPASS)analogLowpass=(SendMessageW(GetDlgItem(hwnd,CTRL_LOWPASS),BM_GETCHECK,0,0)==BST_CHECKED);
       if(id==CTRL_OPEN)openSong();
+      if(id==CTRL_OPEN_ROM)openRom();
       if(id==CTRL_PROFILE && HIWORD(w)==CBN_SELCHANGE){
         const int profile=(int)SendMessageW(profileHandle,CB_GETCURSEL,0,0);
         if(profile>=0 && profile<=2)selectedTimingProfile=profile;
