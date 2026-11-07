@@ -23,6 +23,7 @@ struct RomAudioChunk {
     std::vector<uint8_t> vgm;  // first chunk = VGM; later chunks = VGM commands + 0x66
     std::string error;
     uint64_t totalSamples=0;
+    bool fadeFinished=false;
 };
 class Sonic3KStream {
 public:
@@ -31,6 +32,8 @@ public:
     Sonic3KStream(const Sonic3KStream&) = delete;
     Sonic3KStream& operator=(const Sonic3KStream&) = delete;
     RomAudioChunk advance(unsigned seconds);
+    // Post an original Sonic 3K sound command, e.g. $E1 fade-out.
+    void sendCommand(uint8_t command);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

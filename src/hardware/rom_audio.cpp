@@ -4,6 +4,7 @@
 #include "vgm_trace.h"
 #include <algorithm>
 #include <exception>
+#include <atomic>
 namespace mda {
 RomAudioResult renderSonic3KRom(const std::vector<uint8_t>& rom, uint8_t musicId,
                                 unsigned seconds, int region) {
@@ -55,6 +56,10 @@ struct Sonic3KStream::Impl {
     uint64_t previousSample=0;
     int lastAddress[2]={-1,-1};
     bool first=true;
+    std::atomic<uint8_t> queuedCommand{0};
+    bool fadeStarted=false;
+    bool fadeCountObserved=false;
+    bool fadeEnded=false;
     explicit Impl(const std::vector<uint8_t>& rom, uint8_t id, int region)
       : cpu(bus),clock(region==50?3546895u:3579545u),
         ymClock(region==50?7600489u:7670454u),hz(region) {
@@ -84,10 +89,25 @@ struct Sonic3KStream::Impl {
         RomAudioChunk result;
         if(seconds==0 || seconds>60){result.error="Bad chunk duration";return result;}
         for(unsigned f=0;f<seconds*unsigned(hz);f++) {
+            // Write to the actual 68K->Z80 music command mailbox.
+            // Only the worker advancing this CPU ever touches bus RAM.
+            const uint8_t command=queuedCommand.exchange(0);
+            if(command){
+                bus.z80Write(0x1c0a,command);
+                if(command==0xE1 || command==0xE5){
+                    fadeStarted=true;fadeCountObserved=false;fadeEnded=false;
+                }
+            }
             cpu.requestInterrupt();
             const uint64_t target=500000ull+(++completedFrames*uint64_t(clock))/unsigned(hz);
             if(cpu.cycles()<target)cpu.runCycles(target-cpu.cycles());
+            if(fadeStarted){
+                const uint8_t remaining=bus.z80RamRead(0x1c0d); // zFadeOutTimeout
+                if(remaining)fadeCountObserved=true;
+                else if(fadeCountObserved)fadeEnded=true;
+            }
         }
+        result.fadeFinished=fadeEnded;
         auto &out=result.vgm;
         if(first) {
             out.assign(0x40,0);
@@ -123,4 +143,5 @@ Sonic3KStream::Sonic3KStream(const std::vector<uint8_t>& rom,uint8_t id,int hz)
 :impl_(std::make_unique<Impl>(rom,id,hz)){}
 Sonic3KStream::~Sonic3KStream()=default;
 RomAudioChunk Sonic3KStream::advance(unsigned seconds){return impl_->advance(seconds);}
+void Sonic3KStream::sendCommand(uint8_t command){impl_->queuedCommand.store(command);}
 }
