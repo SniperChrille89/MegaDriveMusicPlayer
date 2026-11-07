@@ -1,7 +1,13 @@
 #pragma once
 #include "audio_bus.h"
 #include <cstdint>
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include "z80.h"
+#ifdef __cplusplus
+}
+#endif
 
 namespace mda {
 // Actual Z80 instruction execution, not an SMPS interpreter.
