@@ -41,3 +41,86 @@ RomAudioResult renderSonic3KRom(const std::vector<uint8_t>& rom, uint8_t musicId
     return result;
 }
 }
+
+#include <memory>
+#include <stdexcept>
+namespace mda {
+struct Sonic3KStream::Impl {
+    SoundBus bus;
+    Z80Driver cpu;
+    uint32_t clock;
+    uint32_t ymClock;
+    int hz;
+    uint64_t completedFrames=0;
+    uint64_t previousSample=0;
+    int lastAddress[2]={-1,-1};
+    bool first=true;
+    explicit Impl(const std::vector<uint8_t>& rom, uint8_t id, int region)
+      : cpu(bus),clock(region==50?3546895u:3579545u),
+        ymClock(region==50?7600489u:7670454u),hz(region) {
+        if(hz!=50 && hz!=60) throw std::invalid_argument("Bad region");
+        const auto image=findSonic3KZ80Bootstrap(rom);
+        if(!image.found) throw std::runtime_error(image.message);
+        cpu.load(image.initialRam.data(),image.initialRam.size());
+        bus.loadRom(rom.data(),rom.size());
+        cpu.runCycles(500000);
+        bus.z80Write(0x1c0a,id);
+        bus.z80Write(0x1c02,hz==50?1:0);
+    }
+    uint64_t sampleAt(uint64_t cycles) const {
+        return (cycles*44100ULL+clock/2)/clock;
+    }
+    static void wait(std::vector<uint8_t>& out,uint64_t count) {
+        while(count) {
+            const auto n=static_cast<unsigned>(std::min<uint64_t>(count,65535));
+            out.push_back(0x61);out.push_back(uint8_t(n));out.push_back(uint8_t(n>>8));
+            count-=n;
+        }
+    }
+    static void put32(std::vector<uint8_t>& v,size_t p,uint32_t val) {
+        for(int i=0;i<4;i++)v[p+i]=uint8_t(val>>(8*i));
+    }
+    RomAudioChunk advance(unsigned seconds) {
+        RomAudioChunk result;
+        if(seconds==0 || seconds>60){result.error="Bad chunk duration";return result;}
+        for(unsigned f=0;f<seconds*unsigned(hz);f++) {
+            cpu.requestInterrupt();
+            const uint64_t target=500000ull+(++completedFrames*uint64_t(clock))/unsigned(hz);
+            if(cpu.cycles()<target)cpu.runCycles(target-cpu.cycles());
+        }
+        auto &out=result.vgm;
+        if(first) {
+            out.assign(0x40,0);
+            out[0]='V';out[1]='g';out[2]='m';out[3]=' ';
+            put32(out,8,0x150);put32(out,0x0c,clock);
+            put32(out,0x2c,ymClock);put32(out,0x34,0x0c);
+        }
+        for(const auto& w:bus.trace()) {
+            const uint64_t at=sampleAt(w.z80Cycle);
+            if(at>previousSample){wait(out,at-previousSample);previousSample=at;}
+            if(w.chip==Chip::PSG){out.push_back(0x50);out.push_back(w.value);continue;}
+            const unsigned port=w.port&3,side=port/2;
+            if((port&1)==0)lastAddress[side]=w.value;
+            else if(lastAddress[side]>=0){
+                out.push_back(side?0x53:0x52);
+                out.push_back(uint8_t(lastAddress[side]));out.push_back(w.value);
+            }
+        }
+        bus.clearTrace();
+        const uint64_t end=sampleAt(cpu.cycles());
+        if(end>previousSample){wait(out,end-previousSample);previousSample=end;}
+        out.push_back(0x66); // appendable stream terminator
+        result.totalSamples=previousSample;
+        if(first){
+            put32(out,4,uint32_t(out.size()-4));
+            put32(out,0x18,uint32_t(result.totalSamples));
+            first=false;
+        }
+        return result;
+    }
+};
+Sonic3KStream::Sonic3KStream(const std::vector<uint8_t>& rom,uint8_t id,int hz)
+:impl_(std::make_unique<Impl>(rom,id,hz)){}
+Sonic3KStream::~Sonic3KStream()=default;
+RomAudioChunk Sonic3KStream::advance(unsigned seconds){return impl_->advance(seconds);}
+}

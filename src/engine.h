@@ -11,6 +11,11 @@ class MegaDriveEngine {
 public:
     bool load(const std::vector<uint8_t>& bytes, std::string& error);
     void render(int16_t* stereo, int frames);
+    // Extend a ROM-backed VGM without resetting the chip, DAC or FIR state.
+    // next contains VGM opcodes and a final 0x66 (no header).
+    bool appendRomCommands(const std::vector<uint8_t>& next, uint64_t totalSamples);
+    void enableRomStream() { romStream_=true; }
+    bool romStreamStarved() const { return romStreamStarved_; }
     void requestFade();
     void requestPause();
     void resume();
@@ -86,6 +91,7 @@ private:
     bool sourceRateDeclared_=false;
     uint64_t samples_=0;
     bool finished_=true, paused_=false, fading_=false;
+    bool romStream_=false, romStreamStarved_=false;
     // While paused the VGM sequencer is frozen, but the YM2612 runs through
     // a short natural release envelope, as on the console.
     int pauseTailFrames_=0;

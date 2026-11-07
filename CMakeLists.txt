@@ -103,6 +103,9 @@ endif()
 
 # Regression: a sustained PSG note must fade for four seconds, not mute at time zero.
 if(BUILD_TESTING)
+    add_executable(mda_test_rom_stream_append tests/test_stream_append.cpp)
+    target_link_libraries(mda_test_rom_stream_append PRIVATE mda_wav_render)
+    add_test(NAME rom_stream_append_without_audio_reset COMMAND mda_test_rom_stream_append)
     add_executable(mda_test_fade_all_channels tests/test_fade_all_channels.cpp)
     target_link_libraries(mda_test_fade_all_channels PRIVATE mda_wav_render)
     add_test(NAME all_channel_four_second_fade COMMAND mda_test_fade_all_channels)

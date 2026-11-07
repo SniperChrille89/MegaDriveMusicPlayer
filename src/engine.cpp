@@ -39,6 +39,7 @@ float MegaDriveEngine::PSG::render() {
 uint32_t MegaDriveEngine::u32(size_t i) const {if(i+4>vgm_.size())return 0;return (uint32_t)vgm_[i]|((uint32_t)vgm_[i+1]<<8)|((uint32_t)vgm_[i+2]<<16)|((uint32_t)vgm_[i+3]<<24);}
 uint16_t MegaDriveEngine::u16(size_t i) const {if(i+2>vgm_.size())return 0;return (uint16_t)(vgm_[i]|(vgm_[i+1]<<8));}
 void MegaDriveEngine::reset() {
+    romStream_=false;romStreamStarved_=false;
     std::memset(&ym_,0,sizeof ym_);
     OPN2_SetChipType(ym3438_mode_ym2612);
     OPN2_Reset(&ym_);
@@ -185,6 +186,19 @@ void MegaDriveEngine::applyFade() {
     // silencing PSG/DAC while touching only selected FM operators.
     if(++fadeStep_>=kFadeSteps){fading_=false;finished_=true;}
 }
+bool MegaDriveEngine::appendRomCommands(const std::vector<uint8_t>& next, uint64_t totalSamples) {
+    if(!romStream_ || next.empty() || next.back()!=0x66 || vgm_.empty() || vgm_.back()!=0x66)
+        return false;
+    if(totalSamples>UINT32_MAX)return false;
+    // Replace only the terminator; all YM/PSG/PCM/phase state is preserved.
+    vgm_.pop_back();
+    vgm_.insert(vgm_.end(),next.begin(),next.end());
+    for(int i=0;i<4;i++)vgm_[0x18+i]=uint8_t(totalSamples>>(i*8));
+    const auto eof=uint32_t(vgm_.size()-4);
+    for(int i=0;i<4;i++)vgm_[4+i]=uint8_t(eof>>(i*8));
+    romStreamStarved_=false;
+    return true;
+}
 void MegaDriveEngine::command() {
     if(cursor_>=vgm_.size()){finished_=true;return;}
     const uint8_t c=vgm_[cursor_++];
@@ -202,7 +216,10 @@ void MegaDriveEngine::command() {
         writeYM(0,0x2a,value);
         wait_=c&15;
     }
-    else if(c==0x66) {if(loop_)cursor_=loop_;else finished_=true;}
+    else if(c==0x66) {
+        if(romStream_) {--cursor_;romStreamStarved_=true;wait_=1;}
+        else if(loop_)cursor_=loop_;else finished_=true;
+    }
     else if(c==0x67) {if(need(6)) {
         if(vgm_[cursor_++]!=0x66){finished_=true;return;}
         const uint8_t type=vgm_[cursor_++];const uint32_t size=u32(cursor_);cursor_+=4;

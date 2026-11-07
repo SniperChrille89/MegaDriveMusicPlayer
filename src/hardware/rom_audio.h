@@ -7,9 +7,32 @@ struct RomAudioResult {
     std::vector<uint8_t> vgm;
     std::string error;
     uint64_t ymWrites=0, psgWrites=0;
+    uint64_t totalSamples=0;
 };
 // Render user-supplied Sonic 3K ROM by executing the original Z80 sound driver.
 // Returns a memory-only VGM trace, no intermediate disk file. Non-realtime v0.22.
 RomAudioResult renderSonic3KRom(const std::vector<uint8_t>& rom, uint8_t musicId,
                                   unsigned seconds=60, int region=50);
+}
+
+// A persistent Sonic 3K session: Z80 RAM, bank, CPU and driver state survive
+// between blocks. No ROM or copyrighted game data is embedded in the program.
+#include <memory>
+namespace mda {
+struct RomAudioChunk {
+    std::vector<uint8_t> vgm;  // first chunk = VGM; later chunks = VGM commands + 0x66
+    std::string error;
+    uint64_t totalSamples=0;
+};
+class Sonic3KStream {
+public:
+    explicit Sonic3KStream(const std::vector<uint8_t>& rom, uint8_t id, int region);
+    ~Sonic3KStream();
+    Sonic3KStream(const Sonic3KStream&) = delete;
+    Sonic3KStream& operator=(const Sonic3KStream&) = delete;
+    RomAudioChunk advance(unsigned seconds);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 }

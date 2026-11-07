@@ -113,6 +113,7 @@ static LRESULT CALLBACK timelineProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
   switch(msg){
     case WM_ERASEBKGND:return 1;
     case WM_LBUTTONDOWN:case WM_MOUSEMOVE:case WM_LBUTTONUP:{
+      if(romModeActive.load())return 0; // ROM seeking requires a CPU + bus checkpoint.
       if(msg==WM_LBUTTONDOWN){timelineDragging=true;SetCapture(hwnd);}
       if(!timelineDragging)return 0;
       RECT rc{};GetClientRect(hwnd,&rc);
@@ -276,6 +277,14 @@ static void audioWorker(){
 #ifdef MDA_ROM_AUDIO_ENABLED
   std::future<mda::RomAudioResult> romJob;
   bool romJobRunning=false;
+  std::shared_ptr<mda::Sonic3KStream> romStream;
+  std::future<mda::RomAudioChunk> extendJob;
+  bool extending=false;
+  uint64_t streamTotalSamples=0;
+  bool activeRomStream=false;
+  uint64_t streamEpoch=0,extendEpoch=0;
+  constexpr unsigned InitialSeconds=15, MoreSeconds=12;
+  constexpr uint64_t AheadThreshold=uint64_t(9)*MegaDriveEngine::Rate;
   int romJobIndex=-1;
   int romJobRegion=50;
 #endif
@@ -291,6 +300,9 @@ static void audioWorker(){
     engine.setYamahaCombined(combinedYamaha.load());
     engine.setAnalogLowpass(analogLowpass.load(), analogStrength.load());
     if(stopRequested.exchange(false)){
+      // The original ROM session belongs to the selected song; do not
+      // accidentally append audio to an unrelated song after Stop.
+      activeRomStream=false;++streamEpoch;
       // Stop takes precedence over queued track changes. Allow current fade to
       // finish, and leave the current selection available for Play/restart.
       requested=-1; pending=-1; nextRequested=false; prevRequested=false;
@@ -306,6 +318,7 @@ static void audioWorker(){
       if(n>0)requested=(i-1+n)%n;}
     int r=requested.exchange(-1);
     if(r>=0){pending=r;
+      activeRomStream=false;++streamEpoch;
       if(loaded && !engine.isFinished() && !engine.isPaused())engine.requestFade();
       else loaded=false; // no fade needed when already stopped/paused
     }
@@ -316,6 +329,16 @@ static void audioWorker(){
     }
     pauseState=loaded&&engine.isPaused();
 #ifdef MDA_ROM_AUDIO_ENABLED
+    if(extending && extendJob.wait_for(std::chrono::milliseconds(0))==std::future_status::ready){
+      auto chunk=extendJob.get();extending=false;
+      if(activeRomStream && extendEpoch==streamEpoch && romModeActive.load() && chunk.error.empty() && !chunk.vgm.empty()) {
+        if(engine.appendRomCommands(chunk.vgm,chunk.totalSamples)){
+          streamTotalSamples=chunk.totalSamples;
+          // This is a buffer horizon, NOT a musical loop boundary.
+          playDuration=streamTotalSamples;
+        }
+      }
+    }
     if(romJobRunning && romJob.wait_for(std::chrono::milliseconds(0))==std::future_status::ready){
       auto result=romJob.get();romJobRunning=false;
       // Discard a stale result when a different song/mode was requested.
@@ -323,11 +346,13 @@ static void audioWorker(){
         std::string error;
         if(engine.load(result.vgm,error)){
           engine.setRegion(romJobRegion);engine.setTimingProfile(0);
+          engine.enableRomStream();activeRomStream=true;++streamEpoch;
+          streamTotalSamples=result.totalSamples;
           currentFileRate=romJobRegion;currentFileRateDeclared=true;
           loaded=true;current=pending;pending=-1;
           loadedVgm=result.vgm;checkpoints.clear();checkpoints.emplace(0,engine);
           lastCheckpoint=0;playPosition=0;
-          playDuration=uint64_t(readLe32(result.vgm,0x18));
+          playDuration=result.totalSamples;
           playLoopStart=UINT64_MAX;
           PostMessageW(windowHandle,WM_STATUS,4,0);
         }else {loaded=false;pending=-1;PostMessageW(windowHandle,WM_STATUS,3,0);}
@@ -348,7 +373,19 @@ static void audioWorker(){
             if(rom){
               romJobIndex=pending;romJobRegion=selectedRegion.load();
               auto id=song.musicId;auto hz=romJobRegion;
-              romJob=std::async(std::launch::async,[rom,id,hz]{return mda::renderSonic3KRom(*rom,id,60,hz);});
+              // A fresh persistent CPU is created for each song, and reused
+              // by the asynchronous extension tasks.
+              try {
+                romStream=std::make_shared<mda::Sonic3KStream>(*rom,id,hz);
+                auto session=romStream;
+                romJob=std::async(std::launch::async,[session]{
+                    auto chunk=session->advance(InitialSeconds);
+                    mda::RomAudioResult out;
+                    out.vgm=std::move(chunk.vgm);out.error=std::move(chunk.error);
+                    out.totalSamples=chunk.totalSamples;
+                    return out;
+                });
+              } catch(const std::exception&) {pending=-1;PostMessageW(windowHandle,WM_STATUS,5,0);continue;}
               romJobRunning=true;
               PostMessageW(windowHandle,WM_STATUS,6,0);
             }else {pending=-1;PostMessageW(windowHandle,WM_STATUS,5,0);}
@@ -372,8 +409,20 @@ static void audioWorker(){
       }
       else pending=-1;
     }
+#ifdef MDA_ROM_AUDIO_ENABLED
+    // Render more original-driver events while the previous audio is playing.
+    // Never reset the emulated chips at the chunk boundary.
+    if(activeRomStream && !extending && !romJobRunning && romStream &&
+       streamTotalSamples>engine.position() &&
+       streamTotalSamples-engine.position()<AheadThreshold &&
+       !engine.isFading() && !engine.isFinished()) {
+        extending=true;extendEpoch=streamEpoch;
+        auto session=romStream;
+        extendJob=std::async(std::launch::async,[session]{return session->advance(MoreSeconds);});
+    }
+#endif
     const uint64_t seek=seekRequested.exchange(UINT64_MAX);
-    if(seek!=UINT64_MAX && loaded && !loadedVgm.empty() && playDuration.load()){
+    if(seek!=UINT64_MAX && loaded && !loadedVgm.empty() && playDuration.load() && !activeRomStream){
       seekBusy=true;
       // Remove queued sound so audio does not briefly play the old position.
       waveOutReset(wo);
@@ -497,9 +546,14 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
     case WM_TIMER:{
       if(w==1){
         const uint64_t pos=playPosition.load(),dur=playDuration.load(),loop=playLoopStart.load();
-        std::wstring info=L"Intro   |   ";
-        info+=(loop!=UINT64_MAX?L"Loop @ "+clockText(loop):L"Loop: not identified");
-        info+=L"                  "+clockText(pos)+L" / "+clockText(dur);
+        std::wstring info;
+        if(romModeActive.load()) {
+          info=L"Continuous Z80  |  Loop markers: pending analysis  |  " +clockText(pos)+L"  (buffered to "+clockText(dur)+L")";
+        } else {
+          info=L"Intro   |   ";
+          info+=(loop!=UINT64_MAX?L"Loop @ "+clockText(loop):L"Loop: not identified");
+          info+=L"                  "+clockText(pos)+L" / "+clockText(dur);
+        }
         if(seekBusy.load())info+=L"  (seeking...)";
         SetWindowTextW(timelineInfoHandle,info.c_str());
         InvalidateRect(timelineHandle,nullptr,FALSE);
@@ -507,7 +561,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       return 0;
     }
     case WM_SEEK_TO:{
-      if(playDuration.load()>0){seekRequested=uint64_t(l);}
+      if(playDuration.load()>0 && !romModeActive.load()){seekRequested=uint64_t(l);}
       return 0;
     }
     case WM_HSCROLL:{
@@ -567,13 +621,13 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
     }
     case WM_STATUS:{
       if(romListMode){
-        if(w==6)showStatus(L"ROM: Preparing original Z80 music in memory (60 seconds)...");
+        if(w==6)showStatus(L"ROM: Starting persistent Z80 audio session...");
         else if(w==5)showStatus(L"ROM: Z80 driver could not generate sound for this selection");
         else if(w==3)showStatus(L"ROM: Failed to initialize audio engine");
         else if(w==4 || w==1){
           int i=current.load();
           if(i>=0 && i<(int)romTracks.size()){
-            showStatus(L"ROM playback: "+widenAscii(romTracks[i].label)+L" | "+(selectedRegion.load()==50?L"PAL":L"NTSC")+L" | 60-second driver trace");
+            showStatus(L"ROM playback: "+widenAscii(romTracks[i].label)+L" | "+(selectedRegion.load()==50?L"PAL":L"NTSC")+L" | continuous original Z80 driver");
             SendMessageW(listHandle,LB_SETCURSEL,i,0);
           }
         }
