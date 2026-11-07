@@ -14,6 +14,12 @@ int main(int argc,char** argv){
  assert(found.tracks.size()==51);
  assert(found.tracks[0].command==1 && found.tracks[49].command==0x32);
  assert(found.tracks[50].command==0xdc);
+ assert(found.tracks[0].label=="Angel Island Zone - Act 1 [$01]");
+ assert(found.tracks[0x0C].label=="Launch Base Zone - Act 1 [$0D]");
+ assert(found.tracks[0x18].label=="End Boss / Big Arms [$19]");
+ assert(found.tracks[0x1E].label=="Knuckles Theme [$1F]");
+ assert(found.tracks[0x2D].label=="Miniboss - Robotnik [$2E]");
+ assert(found.tracks[0x2F].label=="Final Boss [$30]");
  if(argc>1){
    std::ifstream f(argv[1],std::ios::binary);
    if(!f){std::cerr<<"Cannot open ROM\n";return 2;}

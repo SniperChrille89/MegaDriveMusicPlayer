@@ -378,8 +378,8 @@ static void audioWorker(){
               try {
                 romStream=std::make_shared<mda::Sonic3KStream>(*rom,id,hz);
                 auto session=romStream;
-                romJob=std::async(std::launch::async,[session]{
-                    auto chunk=session->advance(InitialSeconds);
+                romJob=std::async(std::launch::async,[session, seconds=15u]{
+                    auto chunk=session->advance(seconds);
                     mda::RomAudioResult out;
                     out.vgm=std::move(chunk.vgm);out.error=std::move(chunk.error);
                     out.totalSamples=chunk.totalSamples;
@@ -418,7 +418,7 @@ static void audioWorker(){
        !engine.isFading() && !engine.isFinished()) {
         extending=true;extendEpoch=streamEpoch;
         auto session=romStream;
-        extendJob=std::async(std::launch::async,[session]{return session->advance(MoreSeconds);});
+        extendJob=std::async(std::launch::async,[session, seconds=12u]{return session->advance(seconds);});
     }
 #endif
     const uint64_t seek=seekRequested.exchange(UINT64_MAX);
