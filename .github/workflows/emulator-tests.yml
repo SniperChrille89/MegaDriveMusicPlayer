@@ -28,16 +28,19 @@ jobs:
           & './build-cpu/Release/mda_z80_generate_vgm.exe' 'cpu-demo/Z80_CPU_Demo.vgm'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item 'build-cpu/Release/mda_z80_generate_vgm.exe' cpu-demo/
+          & './build-cpu/Release/mda_vgm_to_wav.exe' 'cpu-demo/Z80_CPU_Demo.vgm' 'cpu-demo/Z80_CPU_Demo.wav'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Include real-ROM Z80 bootstrap diagnostic
         shell: pwsh
         run: |
           Copy-Item 'build-cpu/Release/mda_s3k_z80_probe.exe' cpu-demo/
+          Copy-Item 'build-cpu/Release/mda_vgm_to_wav.exe' cpu-demo/
           Copy-Item 'build-cpu/Release/mda_s3k_rom_scan.exe' cpu-demo/
           Set-Content -Path 'cpu-demo/TEST_ROM.txt' -Value @'
           This diagnostic needs a ROM you supply locally. No ROM is uploaded to GitHub.
           Open PowerShell in this directory and run:
           .\mda_s3k_rom_scan.exe "C:\path\to\Sonic3K.bin"
-          .\mda_s3k_z80_probe.exe "C:\path\to\Sonic3K.bin" "driver_bootstrap_trace.vgm"
+          .\mda_s3k_z80_probe.exe "C:\path\to\Sonic3K.bin" "driver_bootstrap_trace.vgm" 01 "driver_audio.wav"
           This checks original Z80 bootstrap execution, NOT full music playback.
           '@
       - name: Upload Z80 driver demo
