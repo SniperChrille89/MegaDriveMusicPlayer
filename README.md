@@ -100,3 +100,6 @@ The standalone startup test can be compiled on Linux using `g++` with `src/engin
 ## v0.14 experimental CPU-driven audio backend
 
 See [README_CPU_ENGINE.md](README_CPU_ENGINE.md). The existing playable Windows EXE is preserved. New GitHub workflow `CPU Audio Engine (Z80)` separately tests real Z80 execution into the sound bus and generates a small `Z80_CPU_Demo.vgm`. This is not yet the Sonic SMPS sound driver or a replacement for the VGM playback frontend.
+
+## Experimental v0.19 ROM driver bootstrap test
+See `README_v019.md`. This is a ROM-derived Z80 CPU diagnostic, **not yet a complete ROM soundtrack player**.
