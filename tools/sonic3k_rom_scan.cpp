@@ -10,7 +10,7 @@ int main(int argc,char**argv){
  std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),{});
  auto r=mda::findSonic3KZ80Bootstrap(bytes);
  if(!r.found){std::cerr<<r.message<<"\n";return 1;}
- std::cout<<"Found Sonic-style Z80 startup at ROM offset 0x"<<std::hex<<r.romOffset
- <<"; Z80 initial RAM image: "<<std::dec<<r.initialRam.size()<<" bytes\n";
+ std::cout<<"Decoded Kosinski-compressed Sonic 3K Z80 driver from ROM offset 0x"<<std::hex<<r.romOffset
+ <<"; second data block: 0x"<<r.dataRomOffset<<"; Z80 initial RAM image: "<<std::dec<<r.initialRam.size()<<" bytes\n";
  return 0;
 }

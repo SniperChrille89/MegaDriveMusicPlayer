@@ -15,6 +15,7 @@ void Z80Driver::reset(){
     core_.port_in=&in; core_.port_out=&out;
 }
 void Z80Driver::load(const uint8_t* data,size_t count){bus_.reset();bus_.loadZ80(data,count);reset();}
+void Z80Driver::requestInterrupt(){ z80_gen_int(&core_, 0xff); }
 uint64_t Z80Driver::runCycles(uint64_t amount){
     const auto start=uint64_t(core_.cyc);
     while(uint64_t(core_.cyc)-start < amount) z80_step(&core_);

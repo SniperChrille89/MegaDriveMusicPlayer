@@ -26,6 +26,8 @@ if(BUILD_TESTING)
     add_test(NAME sonic3k_bootstrap_extraction COMMAND mda_test_sonic_driver_image)
 endif()
 
+add_executable(mda_test_real_sonic_driver tests/test_real_sonic_driver.cpp)
+target_link_libraries(mda_test_real_sonic_driver PRIVATE mda_sonic_driver_image)
 add_executable(mda_s3k_rom_scan tools/sonic3k_rom_scan.cpp)
 target_link_libraries(mda_s3k_rom_scan PRIVATE mda_sonic_driver_image)
 target_compile_features(mda_s3k_rom_scan PRIVATE cxx_std_17)

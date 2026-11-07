@@ -19,6 +19,7 @@ public:
     void reset();
     void load(const uint8_t* data, size_t count);
     uint64_t runCycles(uint64_t count);
+    void requestInterrupt(); // Sonic 3K Z80 V-Int (IM1, vector $0038)
     uint16_t pc() const { return core_.pc; }
     uint64_t cycles() const { return core_.cyc; }
 private:
