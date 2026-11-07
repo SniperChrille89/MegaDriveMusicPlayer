@@ -130,7 +130,7 @@ static LRESULT CALLBACK timelineProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       PAINTSTRUCT ps{};HDC dc=BeginPaint(hwnd,&ps);
       RECT rc{};GetClientRect(hwnd,&rc);
       HBRUSH bg=CreateSolidBrush(RGB(245,245,245));FillRect(dc,&rc,bg);DeleteObject(bg);
-      const int y=19,xa=16,xb=std::max(xa+1,rc.right-16);
+      const int y=19,xa=16,xb=std::max(xa+1,static_cast<int>(rc.right)-16);
       HPEN rail=CreatePen(PS_SOLID,5,RGB(195,200,205));HPEN old=(HPEN)SelectObject(dc,rail);
       MoveToEx(dc,xa,y,nullptr);LineTo(dc,xb,y);
       SelectObject(dc,old);DeleteObject(rail);
