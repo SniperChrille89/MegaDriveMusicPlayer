@@ -74,10 +74,10 @@ private:
     std::vector<uint8_t> vgm_, pcm_;
     size_t cursor_=0, loop_=0, pcmIndex_=0;
     uint32_t wait_=0, ymClock_=7670454, psgClock_=3579545;
-    // 8x oversampled reconstruction, then a 161-tap windowed-sinc
-    // anti-aliasing filter before reducing to the 44.1 kHz output rate.
-    static constexpr int Oversample = 8;
-    static constexpr int FirTaps = 161;
+    // Preserve every native YM2612 output slot, then low-pass at the chip
+    // output rate (~1.28 MHz) before sampling at 44.1 kHz. This avoids
+    // the phase-dependent 3/4-clock averaging used before v0.25.
+    static constexpr int FirTaps = 385;
     std::array<std::array<float, FirTaps>, 4> reconstruct_{};
     int reconstructHead_ = 0;
     double clockFrac_=0;

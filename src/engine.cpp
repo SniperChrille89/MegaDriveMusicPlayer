@@ -88,10 +88,6 @@ double MegaDriveEngine::eventSpeed() const {
 }
 void MegaDriveEngine::writeYM(int port,uint8_t address,uint8_t value) {
     registers_[port][address]=value;
-    // During hardware fade, keep the unfaded TL in the shadow registers.
-    // Subsequent fade ticks will write the attenuated carrier TL values.
-    // Never let an incoming VGM TL write momentarily restore full loudness.
-    if (fading_ && address >= 0x40 && address <= 0x4f) return;
     // TFI/VGM register data remain unmodified during ordinary playback.
     // Nuked OPN2 is clock-cycle accurate: writes must be serviced over time.
     // Sending address and data back-to-back overwrites write_data before the
@@ -138,9 +134,9 @@ void MegaDriveEngine::primeInitialYMRegisters() {
 void MegaDriveEngine::startFade(bool /*pause*/) {
     if(finished_ || fading_)return;
     fading_=true;fadeStep_=0;fadeCounter_=0;
-    // Kill new DAC playback and PSG immediately; let FM decay through TL changes.
-    writeYM(0,0x2b,0);
-    for(int ch=0;ch<4;ch++)psg_.write((uint8_t)(0x90+(ch<<5)+15));
+    // Keep the sequencer and ALL sound sources running during fade.
+    // Muting PSG/DAC immediately made the old fade uneven and cut off drums.
+    // Apply a common output envelope to FM, DAC and PSG in sample().
 }
 void MegaDriveEngine::requestFade(){startFade(false);}
 void MegaDriveEngine::requestPause(){
@@ -182,32 +178,20 @@ void MegaDriveEngine::setAnalogLowpass(bool enabled, int strengthPercent) {
     lowpassStrength_=std::clamp(strengthPercent,5,95);
 }
 void MegaDriveEngine::applyFade() {
-    // Sonic 3K zFadeOutMusic initializes $28 steps, 6 music-driver ticks
-    // between each. zDoMusicFadeOut increases each FM track volume by 1
-    // before sending new carrier TL values. VGM lacks the Z80 track RAM,
-    // so this applies that +1 progression to the shadowed carrier TLs.
-    const int addition=fadeStep_+1;
-    for(int port=0;port<2;port++)for(int ch=0;ch<3;ch++) {
-        const uint8_t alg=registers_[port][0xb0+ch]&7;
-        // YM2612 hardware operator slots: S1,S3,S2,S4 at offsets 0,4,8,12.
-        const bool carriers[8][4]={{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1},
-                                   {0,1,0,1},{0,1,1,1},{0,1,1,1},{1,1,1,1}};
-        for(int op=0;op<4;op++)if(carriers[alg][op]){
-            const int addr=0x40+ch+op*4;
-            const uint8_t v=(uint8_t)std::min(127,(registers_[port][addr]&127)+addition);
-            // Temporary fade value: do not overwrite the original TL shadow.
-            ymWrites_.push_back({(uint8_t)port,(uint8_t)addr,v});
-        }
-    }
+    // Playback-level fade: 40 steps spaced 0.1 s apart, 4 s overall.
+    // This is NOT the original Sonic Z80 fade command: a captured VGM
+    // register stream cannot access or change the Z80 driver's track RAM.
+    // It does guarantee PSG, FM, and DAC fade together rather than abruptly
+    // silencing PSG/DAC while touching only selected FM operators.
     if(++fadeStep_>=kFadeSteps){fading_=false;finished_=true;}
 }
 void MegaDriveEngine::command() {
     if(cursor_>=vgm_.size()){finished_=true;return;}
     const uint8_t c=vgm_[cursor_++];
     auto need=[&](size_t n){if(cursor_+n>vgm_.size()){finished_=true;return false;}return true;};
-    if(c==0x50) {if(need(1)){const uint8_t v=vgm_[cursor_++];if(!fading_)psg_.write(v);}}
+    if(c==0x50) {if(need(1)){const uint8_t v=vgm_[cursor_++];psg_.write(v);}}
     else if(c==0x52||c==0x53) {if(need(2)){uint8_t a=vgm_[cursor_++],v=vgm_[cursor_++];
-        if(!(fading_&&(a==0x2a||a==0x2b)))writeYM(c==0x53,a,v);
+        writeYM(c==0x53,a,v);
     }}
     else if(c==0x61) {if(need(2)){wait_=u16(cursor_);cursor_+=2;}}
     else if(c==0x62)wait_=735;
@@ -215,7 +199,7 @@ void MegaDriveEngine::command() {
     else if(c>=0x70&&c<=0x7f)wait_=(c&15)+1;
     else if(c>=0x80&&c<=0x8f) {
         const uint8_t value=pcmIndex_<pcm_.size()?pcm_[pcmIndex_++]:0x80;
-        if(!fading_)writeYM(0,0x2a,value);
+        writeYM(0,0x2a,value);
         wait_=c&15;
     }
     else if(c==0x66) {if(loop_)cursor_=loop_;else finished_=true;}
@@ -259,17 +243,21 @@ void MegaDriveEngine::tick(){
     if(fading_ && ++fadeCounter_>=kSamplesPerFadeStep) {fadeCounter_=0;applyFade();}
     ++samples_;
 }
-// Reconstruct the multiplexed YM2612 output before downsampling.  The
-// previous engine averaged ~29 clock ticks directly into each 44.1kHz
-// sample, a boxcar filter with very poor stopband rejection.  YM2612 DAC
-// audio and some FM timbres therefore produced audible aliases.
-static const std::array<float, 161>& reconstructionKernel() {
+// Low-pass the actual switched YM2612 output at its native clock tick rate.
+// The earlier implementation averaged only ~3-4 OPN2_Clock() calls per
+// sub-sample. That box integration discarded the relative phase of FM/DAC
+// output slots, producing strongly time-varying passband response. Keeping
+// EVERY clock tick until reconstruction makes the process deterministic.
+// The YM output signal is time-division multiplexed (24 slots / frame), so
+// we must reject its ~53 kHz slot switching BEFORE 44.1 kHz decimation.
+static const std::array<float, 385>& reconstructionKernel() {
     static const auto taps=[] {
-        std::array<float, 161> f{};
-        // 19 kHz cutoff at 8*44.1kHz, Blackman window (high stopband rejection).
+        std::array<float, 385> f{};
         constexpr double pi=3.14159265358979323846;
-        constexpr double fc=19000.0/(44100.0*8.0);
-        constexpr int N=161;
+        // Worst-case NTSC/PAL YM output clock is ~1.27 MHz.
+        // 18 kHz cutoff; Blackman window suppresses the 53 kHz carrier.
+        constexpr double fc=18000.0/(7600489.0/6.0);
+        constexpr int N=385;
         double sum=0;
         for(int n=0;n<N;n++) {
             const double x=n-(N-1)*0.5;
@@ -292,36 +280,32 @@ void MegaDriveEngine::sample(int16_t* output) {
     const double psgScale=(targetRate_==sourceRate_)?1.0:
         (targetRate_==50?palPsg/ntscPsg:ntscPsg/palPsg);
 
-    // Filter FM and DAC *separately* so their sliders remain independent.
-    // Each internal clock contributes to exactly one bus based on the
-    // Nuked output multiplexing slot (not the note's channel number).
-    for(int sub=0;sub<Oversample;sub++) {
-        clockFrac_+=((double)ymClock_*ymScale)/6.0/(Rate*Oversample);
-        const int clocks=(int)clockFrac_;clockFrac_-=clocks;
-        int64_t fmL=0,fmR=0,dacL=0,dacR=0;
-        Bit16s b[2]{};
-        for(int i=0;i<clocks;i++){
-            clockYMWrite();
-            const bool dacSlot=ym_.dacen && ((ym_.cycles>>2)==1);
-            OPN2_Clock(&ym_,b);
-            if(dacSlot){dacL+=b[0];dacR+=b[1];}
-            else {fmL+=b[0];fmR+=b[1];}
-        }
-        // The YM2612 output is a switched time-division signal. Missing
-        // DAC slots must contribute zero to DAC, not a held full DAC level.
-        const float inv=clocks?1.0f/(clocks*256.0f):0.0f;
-        reconstruct_[0][reconstructHead_]=(float)fmL*inv;
-        reconstruct_[1][reconstructHead_]=(float)fmR*inv;
-        reconstruct_[2][reconstructHead_]=(float)dacL*inv;
-        reconstruct_[3][reconstructHead_]=(float)dacR*inv;
+    // OPN2_Clock is called once per native YM output slot (master clock/6).
+    // Do not average samples in groups of 3-4. Distribute the chip clock
+    // fractional remainder across output frames, retaining all source ticks.
+    clockFrac_+=((double)ymClock_*ymScale)/(6.0*Rate);
+    const int clocks=(int)clockFrac_;clockFrac_-=clocks;
+    Bit16s b[2]{};
+    for(int i=0;i<clocks;i++) {
+        clockYMWrite();
+        const bool dacSlot=ym_.dacen && ((ym_.cycles>>2)==1);
+        OPN2_Clock(&ym_,b);
+        // In YM2612 mode each OPN2_Clock returns an analog output slot;
+        // preserve the tiny ladder-DAC sign leakage in the same path.
+        // Division by 256 follows the project's pre-existing gain staging.
+        const int bus=dacSlot?2:0;
+        reconstruct_[bus][reconstructHead_]=float(b[0])/256.f;
+        reconstruct_[bus+1][reconstructHead_]=float(b[1])/256.f;
+        reconstruct_[2-bus][reconstructHead_]=0.f;
+        reconstruct_[3-bus][reconstructHead_]=0.f;
         reconstructHead_=(reconstructHead_+1)%FirTaps;
     }
     const auto& taps=reconstructionKernel();
     float bus[4]{};
     int index=(reconstructHead_+FirTaps-1)%FirTaps;
-    for(int i=0;i<FirTaps;i++){
+    for(int i=0;i<FirTaps;i++) {
         const float a=taps[i];
-        for(int j=0;j<4;j++)bus[j]+=reconstruct_[j][index]*a;
+        for(int j=0;j<4;j++) bus[j]+=reconstruct_[j][index]*a;
         if(--index<0)index=FirTaps-1;
     }
     psg_.clock=(double)psgClock_*psgScale;
@@ -333,8 +317,13 @@ void MegaDriveEngine::sample(int16_t* output) {
                       : bus[0]*fmGain_+bus[2]*dacGain_)*.77f;
     const float right=(yamahaCombined_ ? (bus[1]+bus[3])*fmGain_
                        : bus[1]*fmGain_+bus[3]*dacGain_)*.77f;
-    float l=(left+psg)*kOutputGain*masterGain_;
-    float r=(right+psg)*kOutputGain*masterGain_;
+    // Apply to the combined output so the *same* fade affects all channels.
+    // Smooth between 0.1-second steps to avoid an audible amplitude staircase.
+    const float fadeGain = fading_
+        ? std::max(0.f, 1.f - (float(fadeStep_) + float(fadeCounter_)/float(kSamplesPerFadeStep)) / float(kFadeSteps))
+        : 1.f;
+    float l=(left+psg)*kOutputGain*masterGain_*fadeGain;
+    float r=(right+psg)*kOutputGain*masterGain_*fadeGain;
     // Optional output coloration, not the mandatory anti-alias filter above.
     // One-pole RC low-pass with a bounded cutoff, sample-rate independent.
     if (analogLowpassEnabled_) {
