@@ -105,7 +105,7 @@ struct Sonic3KStream::Impl {
                     switchedOnThisFrame=true;
                 }
             }
-            if(switchedOnThisFrame)result.songSwitched=true;
+            if(switchedOnThisFrame){result.songSwitched=true;result.switchedMusicId=command;}
             cpu.requestInterrupt();
             const uint64_t target=500000ull+(++completedFrames*uint64_t(clock))/unsigned(hz);
             if(cpu.cycles()<target)cpu.runCycles(target-cpu.cycles());

@@ -25,6 +25,7 @@ struct RomAudioChunk {
     uint64_t totalSamples=0;
     bool fadeFinished=false;
     bool songSwitched=false; // A queued music ID was dispatched in the live Z80 session.
+    uint8_t switchedMusicId=0; // Disambiguates a completed earlier async chunk.
 };
 class Sonic3KStream {
 public:

@@ -23,6 +23,7 @@
 #include <cmath>
 #ifdef MDA_ROM_AUDIO_ENABLED
 #include "hardware/rom_audio.h"
+#include "hardware/fade_transition.h"
 #endif
 #include "engine.h"
 #include "hardware/rom_catalog.h"
@@ -46,6 +47,7 @@ static std::mutex songsMutex;
 static std::atomic<int> requested{-1}, current{-1};
 static std::atomic<bool> running{true}, pauseRequested{false}, pauseState{false};
 static std::atomic<bool> nextRequested{false}, prevRequested{false}, stopRequested{false};
+static std::atomic<bool> romFadeUiActive{false}; // Expose pending native fade to Play button
 static std::atomic<bool> combinedYamaha{false}, analogLowpass{false};
 static std::atomic<int> analogStrength{45};
 static HWND lowpassSlider{}, lowpassLabel{};
@@ -254,7 +256,7 @@ static void audioWorker(){
         // No master fade, no FM TL rewriting, and no immediate PSG/DAC mute.
         romStream->cancelQueuedSong();
         romStream->sendCommand(0xE1);
-        romFadePending=true;romFadeComplete=false;
+        romFadePending=true;romFadeComplete=false;romFadeUiActive=true;
       } else
 #endif
       if(loaded && !engine.isFinished()) {
@@ -267,28 +269,43 @@ static void audioWorker(){
     if(prevRequested.exchange(false)){int i=current.load();int n;{std::lock_guard<std::mutex> lock(songsMutex);n=(int)songs.size();}
       if(n>0)requested=(i-1+n)%n;}
     int r=requested.exchange(-1);
-    if(r>=0){pending=r;
+    if(r>=0){
 #ifdef MDA_ROM_AUDIO_ENABLED
       if(activeRomStream && romStream && loaded && !engine.isFinished()){
         Song target;bool valid=false;
         {std::lock_guard<std::mutex> lock(songsMutex);
           if(r<(int)songs.size()){target=songs[r];valid=true;}}
         if(valid && target.fromRom && target.musicId) {
-          // Do not tear down Z80 / YM2612 / PSG between Sonic tracks.
-          // Queue the next music ID so the original driver receives it near
-          // the end of its own fade, with no silent device reset in between.
-          romStream->queueSongAfterFade(target.musicId);
-          if(!romFadePending)romStream->sendCommand(0xE1);
-          romFadePending=true;romFadeComplete=false;
-        } else {
+          // A second selection of the queued song overrides the native fade.
+          // Any selection during a Stop fade (no queued target) also overrides.
+          // The current Z80/OPN2/PSG session and audio device stay alive.
+          const bool interrupt=mda::shouldInterruptFade(romFadePending,pending,r);
+          pending=r;
+          if(interrupt){
+            romStream->cancelQueuedSong();
+            romStream->sendCommand(target.musicId);
+            romFadePending=false;romFadeComplete=false;romFadeEnd=0;
+            romFadeUiActive=false;
+          }else{
+            romStream->queueSongAfterFade(target.musicId);
+            if(!romFadePending)romStream->sendCommand(0xE1);
+            romFadePending=true;romFadeComplete=false;
+            romFadeUiActive=true;
+          }
+        }else{
+          pending=r;
           romStream->cancelQueuedSong();
           romStream->sendCommand(0xE1);
           romFadePending=true;romFadeComplete=false;
+          romFadeUiActive=true;
         }
-      } else
+      }else
 #endif
-      if(loaded && !engine.isFinished() && !engine.isPaused())engine.requestFade();
-      else loaded=false;
+      {
+        pending=r;
+        if(loaded && !engine.isFinished() && !engine.isPaused())engine.requestFade();
+        else loaded=false;
+      }
     }
     if(pauseRequested.exchange(false) && loaded){
       if(engine.isFinished())pending=current.load(); // Play after Stop restarts selected song
@@ -304,11 +321,19 @@ static void audioWorker(){
           streamTotalSamples=chunk.totalSamples;
           // This is a buffer horizon, NOT a musical loop boundary.
           playDuration=streamTotalSamples;
+          bool matchedSwitch=false;
           if(chunk.songSwitched && pending>=0){
-            // The next song has begun INSIDE the live Z80 session, and all
-            // corresponding chip writes are already in this audio trace.
+            Song desired;bool valid=false;
+            {std::lock_guard<std::mutex> lock(songsMutex);
+              if(pending<(int)songs.size()){desired=songs[pending];valid=true;}}
+            matchedSwitch=valid && desired.fromRom && desired.musicId==chunk.switchedMusicId;
+          }
+          if(matchedSwitch){
+            // Only acknowledge the exact requested ID: an older asynchronous
+            // chunk must not overwrite a newer, fast-forwarded user selection.
             current=pending;pending=-1;
             romFadePending=false;romFadeComplete=false;romFadeEnd=0;
+            romFadeUiActive=false;
             PostMessageW(windowHandle,WM_STATUS,4,0);
           } else if(romFadePending && chunk.fadeFinished){
             romFadeComplete=true;romFadeEnd=chunk.totalSamples;
@@ -325,6 +350,7 @@ static void audioWorker(){
           engine.setRegion(romJobRegion);engine.setTimingProfile(0);
           engine.enableRomStream();activeRomStream=true;++streamEpoch;
           romFadePending=false;romFadeComplete=false;romFadeEnd=0;
+          romFadeUiActive=false;
           streamTotalSamples=result.totalSamples;
           currentFileRate=romJobRegion;currentFileRateDeclared=true;
           loaded=true;current=pending;pending=-1;
@@ -344,7 +370,7 @@ static void audioWorker(){
     // remaining YM/PSG commands have actually been rendered.
     if(romFadeComplete && engine.position()>=romFadeEnd){
       engine.stop();loaded=false;activeRomStream=false;
-      romFadePending=false;romFadeComplete=false;++streamEpoch;
+      romFadePending=false;romFadeComplete=false;romFadeUiActive=false;++streamEpoch;
     }
 #endif
     if(pending>=0 && (!loaded || engine.isFinished())){
@@ -571,7 +597,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
         if(romListMode){
 #ifdef MDA_ROM_AUDIO_ENABLED
           int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);
-          if(i>=0 && current.load()!=i) requestSong(i);
+          if(i>=0 && (current.load()!=i || romFadeUiActive.load())) requestSong(i);
           else if(i>=0 && current.load()==i) pauseRequested=true;
 #else
           showRomPending();
