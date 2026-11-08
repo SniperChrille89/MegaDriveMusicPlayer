@@ -32,6 +32,9 @@ public:
     Sonic3KStream(const Sonic3KStream&) = delete;
     Sonic3KStream& operator=(const Sonic3KStream&) = delete;
     RomAudioChunk advance(unsigned seconds);
+    // Advance by exact game video frames (PAL 20 ms / NTSC 16.67 ms).
+    // Allows low-latency command dispatch without 1-second pre-generation.
+    RomAudioChunk advanceFrames(unsigned frames);
     // Post an original Sonic 3K sound command, e.g. $E1 fade-out.
     void sendCommand(uint8_t command);
 private:

@@ -209,7 +209,7 @@ static void audioWorker(){
   HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);HWAVEOUT wo{};
   MMRESULT ret=waveOutOpen(&wo,WAVE_MAPPER,&fmt,(DWORD_PTR)event,0,CALLBACK_EVENT);
   if(ret!=MMSYSERR_NOERROR){PostMessageW(windowHandle,WM_STATUS,2,0);CloseHandle(event);return;}
-  constexpr int kBuffers=4,kFrames=1024;
+  constexpr int kBuffers=4,kFrames=512; // ~46 ms total waveOut queue at 44.1 kHz
   struct Buffer{WAVEHDR header{};int16_t data[kFrames*2]{};};
   Buffer buffers[kBuffers]{};
   for(auto& b:buffers){b.header.lpData=(LPSTR)b.data;b.header.dwBufferLength=sizeof b.data;
@@ -224,8 +224,11 @@ static void audioWorker(){
   uint64_t streamTotalSamples=0;
   bool activeRomStream=false;
   uint64_t streamEpoch=0,extendEpoch=0;
-  // Keep prebuffering short so an original Z80 fade command is heard promptly.
-  constexpr uint64_t AheadThreshold=MegaDriveEngine::Rate/2;
+  // Z80 runs in single video frames. Maintain ~60 ms of future ROM data,
+  // not whole seconds. Windows keeps only ~46 ms of queued PCM.
+  constexpr uint64_t AheadThreshold=MegaDriveEngine::Rate*3/50;
+  constexpr unsigned InitialFrames=4;
+  constexpr unsigned RefillFrames=1;
   bool romFadePending=false,romFadeComplete=false;
   uint64_t romFadeEnd=0;
 
@@ -340,8 +343,8 @@ static void audioWorker(){
               try {
                 romStream=std::make_shared<mda::Sonic3KStream>(*rom,id,hz);
                 auto session=romStream;
-                romJob=std::async(std::launch::async,[session]{
-                    auto chunk=session->advance(1);
+                romJob=std::async(std::launch::async,[session, frames=InitialFrames]{
+                    auto chunk=session->advanceFrames(frames);
                     mda::RomAudioResult out;
                     out.vgm=std::move(chunk.vgm);out.error=std::move(chunk.error);
                     out.totalSamples=chunk.totalSamples;
@@ -380,7 +383,7 @@ static void audioWorker(){
        !engine.isFading() && !engine.isFinished() && !romFadeComplete) {
         extending=true;extendEpoch=streamEpoch;
         auto session=romStream;
-        extendJob=std::async(std::launch::async,[session]{return session->advance(1);});
+        extendJob=std::async(std::launch::async,[session, frames=RefillFrames]{return session->advanceFrames(frames);});
     }
 #endif
     const uint64_t seek=seekRequested.exchange(UINT64_MAX);
@@ -416,6 +419,18 @@ static void audioWorker(){
       if(loaded && !engine.isFinished()){
         engine.setVolumes(volumePercent[0].load(),volumePercent[1].load(),
                           volumePercent[2].load(),volumePercent[3].load());
+#ifdef MDA_ROM_AUDIO_ENABLED
+        if(activeRomStream){
+          // Never advance YM/PSG state beyond the Z80 trace horizon. If a
+          // frame is late, pad with silence rather than permanently drifting
+          // the audio clock ahead of the original driver's event timeline.
+          const uint64_t available=streamTotalSamples>engine.position()
+              ?streamTotalSamples-engine.position():0;
+          const int n=static_cast<int>(std::min<uint64_t>(kFrames,available));
+          if(n>0)engine.render(b.data,n);
+          if(n<kFrames)std::memset(b.data+n*2,0,(kFrames-n)*2*sizeof(int16_t));
+        }else
+#endif
         engine.render(b.data,kFrames);
         playPosition=engine.position();
         const uint64_t sec=engine.position()/MegaDriveEngine::Rate;

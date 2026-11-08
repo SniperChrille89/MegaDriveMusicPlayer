@@ -85,10 +85,10 @@ struct Sonic3KStream::Impl {
     static void put32(std::vector<uint8_t>& v,size_t p,uint32_t val) {
         for(int i=0;i<4;i++)v[p+i]=uint8_t(val>>(8*i));
     }
-    RomAudioChunk advance(unsigned seconds) {
+    RomAudioChunk advanceFrames(unsigned frames) {
         RomAudioChunk result;
-        if(seconds==0 || seconds>60){result.error="Bad chunk duration";return result;}
-        for(unsigned f=0;f<seconds*unsigned(hz);f++) {
+        if(frames==0 || frames>unsigned(hz)*60){result.error="Bad frame count";return result;}
+        for(unsigned f=0;f<frames;f++) {
             // Write to the actual 68K->Z80 music command mailbox.
             // Only the worker advancing this CPU ever touches bus RAM.
             const uint8_t command=queuedCommand.exchange(0);
@@ -142,6 +142,10 @@ struct Sonic3KStream::Impl {
 Sonic3KStream::Sonic3KStream(const std::vector<uint8_t>& rom,uint8_t id,int hz)
 :impl_(std::make_unique<Impl>(rom,id,hz)){}
 Sonic3KStream::~Sonic3KStream()=default;
-RomAudioChunk Sonic3KStream::advance(unsigned seconds){return impl_->advance(seconds);}
+RomAudioChunk Sonic3KStream::advance(unsigned seconds){
+    if(seconds==0 || seconds>60){RomAudioChunk r;r.error="Bad chunk duration";return r;}
+    return impl_->advanceFrames(seconds*unsigned(impl_->hz));
+}
+RomAudioChunk Sonic3KStream::advanceFrames(unsigned frames){return impl_->advanceFrames(frames);}
 void Sonic3KStream::sendCommand(uint8_t command){impl_->queuedCommand.store(command);}
 }
