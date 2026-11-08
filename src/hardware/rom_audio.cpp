@@ -1,5 +1,6 @@
 #include "rom_audio.h"
 #include "sonic_driver_image.h"
+#include "fade_transition.h"
 #include "z80_driver.h"
 #include "vgm_trace.h"
 #include <algorithm>
@@ -57,6 +58,7 @@ struct Sonic3KStream::Impl {
     int lastAddress[2]={-1,-1};
     bool first=true;
     std::atomic<uint8_t> queuedCommand{0};
+    std::atomic<uint8_t> nextMusic{0};
     bool fadeStarted=false;
     bool fadeCountObserved=false;
     bool fadeEnded=false;
@@ -89,6 +91,7 @@ struct Sonic3KStream::Impl {
         RomAudioChunk result;
         if(frames==0 || frames>unsigned(hz)*60){result.error="Bad frame count";return result;}
         for(unsigned f=0;f<frames;f++) {
+            bool switchedOnThisFrame=false;
             // Write to the actual 68K->Z80 music command mailbox.
             // Only the worker advancing this CPU ever touches bus RAM.
             const uint8_t command=queuedCommand.exchange(0);
@@ -96,15 +99,27 @@ struct Sonic3KStream::Impl {
                 bus.z80Write(0x1c0a,command);
                 if(command==0xE1 || command==0xE5){
                     fadeStarted=true;fadeCountObserved=false;fadeEnded=false;
+                } else if(command != 0xE2 && command != 0xE3) {
+                    // This command starts a new song in the SAME Z80 instance.
+                    fadeStarted=false;fadeCountObserved=false;fadeEnded=false;
+                    switchedOnThisFrame=true;
                 }
             }
+            if(switchedOnThisFrame)result.songSwitched=true;
             cpu.requestInterrupt();
             const uint64_t target=500000ull+(++completedFrames*uint64_t(clock))/unsigned(hz);
             if(cpu.cycles()<target)cpu.runCycles(target-cpu.cycles());
             if(fadeStarted){
                 const uint8_t remaining=bus.z80RamRead(0x1c0d); // zFadeOutTimeout
                 if(remaining)fadeCountObserved=true;
-                else if(fadeCountObserved)fadeEnded=true;
+                // Trigger the new music while the old song still has two fade
+                // steps left. The next frame executes the normal Sonic 3K
+                // music mailbox command; no audio device or FM/PSG reset.
+                if(shouldQueueNextSong(fadeStarted,fadeCountObserved,remaining,nextMusic.load())) {
+                    const uint8_t next=nextMusic.exchange(0);
+                    if(next)queuedCommand.store(next);
+                }
+                if(!remaining && fadeCountObserved && queuedCommand.load()==0)fadeEnded=true;
             }
         }
         result.fadeFinished=fadeEnded;
@@ -148,4 +163,6 @@ RomAudioChunk Sonic3KStream::advance(unsigned seconds){
 }
 RomAudioChunk Sonic3KStream::advanceFrames(unsigned frames){return impl_->advanceFrames(frames);}
 void Sonic3KStream::sendCommand(uint8_t command){impl_->queuedCommand.store(command);}
+void Sonic3KStream::queueSongAfterFade(uint8_t id){impl_->nextMusic.store(id);}
+void Sonic3KStream::cancelQueuedSong(){impl_->nextMusic.store(0);}
 }

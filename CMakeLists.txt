@@ -114,6 +114,13 @@ if(BUILD_TESTING)
     add_test(NAME all_channel_four_second_fade COMMAND mda_test_fade_all_channels)
 endif()
 
+if(BUILD_TESTING)
+    add_executable(mda_test_fade_transition tests/test_fade_transition.cpp)
+    target_include_directories(mda_test_fade_transition PRIVATE src)
+    target_compile_features(mda_test_fade_transition PRIVATE cxx_std_17)
+    add_test(NAME original_z80_seamless_transition_condition COMMAND mda_test_fade_transition)
+endif()
+
 if(NOT WIN32)
     message(STATUS "Non-Windows host: building portable CPU/bus tests only")
     return()
@@ -139,3 +146,4 @@ else()
     target_link_options(MegaDriveAudio PRIVATE -municode)
 endif()
 set_target_properties(MegaDriveAudio PROPERTIES OUTPUT_NAME "MegaDriveAudio")
+

@@ -252,6 +252,7 @@ static void audioWorker(){
       if(activeRomStream && romStream && loaded && !engine.isFinished()) {
         // The fade is generated INSIDE the original Sonic 3K sound driver.
         // No master fade, no FM TL rewriting, and no immediate PSG/DAC mute.
+        romStream->cancelQueuedSong();
         romStream->sendCommand(0xE1);
         romFadePending=true;romFadeComplete=false;
       } else
@@ -269,7 +270,21 @@ static void audioWorker(){
     if(r>=0){pending=r;
 #ifdef MDA_ROM_AUDIO_ENABLED
       if(activeRomStream && romStream && loaded && !engine.isFinished()){
-        romStream->sendCommand(0xE1);romFadePending=true;romFadeComplete=false;
+        Song target;bool valid=false;
+        {std::lock_guard<std::mutex> lock(songsMutex);
+          if(r<(int)songs.size()){target=songs[r];valid=true;}}
+        if(valid && target.fromRom && target.musicId) {
+          // Do not tear down Z80 / YM2612 / PSG between Sonic tracks.
+          // Queue the next music ID so the original driver receives it near
+          // the end of its own fade, with no silent device reset in between.
+          romStream->queueSongAfterFade(target.musicId);
+          if(!romFadePending)romStream->sendCommand(0xE1);
+          romFadePending=true;romFadeComplete=false;
+        } else {
+          romStream->cancelQueuedSong();
+          romStream->sendCommand(0xE1);
+          romFadePending=true;romFadeComplete=false;
+        }
       } else
 #endif
       if(loaded && !engine.isFinished() && !engine.isPaused())engine.requestFade();
@@ -289,7 +304,13 @@ static void audioWorker(){
           streamTotalSamples=chunk.totalSamples;
           // This is a buffer horizon, NOT a musical loop boundary.
           playDuration=streamTotalSamples;
-          if(romFadePending && chunk.fadeFinished){
+          if(chunk.songSwitched && pending>=0){
+            // The next song has begun INSIDE the live Z80 session, and all
+            // corresponding chip writes are already in this audio trace.
+            current=pending;pending=-1;
+            romFadePending=false;romFadeComplete=false;romFadeEnd=0;
+            PostMessageW(windowHandle,WM_STATUS,4,0);
+          } else if(romFadePending && chunk.fadeFinished){
             romFadeComplete=true;romFadeEnd=chunk.totalSamples;
           }
         }

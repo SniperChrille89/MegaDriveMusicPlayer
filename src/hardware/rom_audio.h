@@ -24,6 +24,7 @@ struct RomAudioChunk {
     std::string error;
     uint64_t totalSamples=0;
     bool fadeFinished=false;
+    bool songSwitched=false; // A queued music ID was dispatched in the live Z80 session.
 };
 class Sonic3KStream {
 public:
@@ -37,6 +38,9 @@ public:
     RomAudioChunk advanceFrames(unsigned frames);
     // Post an original Sonic 3K sound command, e.g. $E1 fade-out.
     void sendCommand(uint8_t command);
+    // Switch in-place near the end of the original driver fade, without a chip reset.
+    void queueSongAfterFade(uint8_t musicId);
+    void cancelQueuedSong();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
