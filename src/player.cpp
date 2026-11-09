@@ -385,10 +385,11 @@ static void audioWorker(){
       requested=-1;pending=-1;nextRequested=false;prevRequested=false;
 #ifdef MDA_ROM_AUDIO_ENABLED
       if(activeRomStream && romStream && loaded && !engine.isFinished()) {
-        // The fade is generated INSIDE the original Sonic 3K sound driver.
-        // No master fade, no FM TL rewriting, and no immediate PSG/DAC mute.
+        // Fixed 5-second chip-register fade. The Z80 keeps generating the
+        // original track; FM TL / PSG levels / DAC data are attenuated before
+        // YM2612's audio reconstruction. This does not use PCM master gain.
         romStream->cancelQueuedSong();
-        romStream->sendCommand(0xE1);
+        romStream->beginFade(5);
         romFadePending=true;romFadeComplete=false;romFadeUiActive=true;
       } else
 #endif
@@ -421,14 +422,14 @@ static void audioWorker(){
             romFadeUiActive=false;
           }else{
             romStream->queueSongAfterFade(target.musicId);
-            if(!romFadePending)romStream->sendCommand(0xE1);
+            if(!romFadePending)romStream->beginFade(3);
             romFadePending=true;romFadeComplete=false;
             romFadeUiActive=true;
           }
         }else{
           pending=r;
           romStream->cancelQueuedSong();
-          romStream->sendCommand(0xE1);
+          romStream->beginFade(3);
           romFadePending=true;romFadeComplete=false;
           romFadeUiActive=true;
         }
@@ -499,8 +500,8 @@ static void audioWorker(){
     }
 #endif
 #ifdef MDA_ROM_AUDIO_ENABLED
-    // Wait until the original driver reports its fade finished and its
-    // remaining YM/PSG commands have actually been rendered.
+    // Wait until the requested chip-register fade has completed and its
+    // remaining YM/PSG events have actually been rendered.
     if(romFadeComplete && engine.position()>=romFadeEnd){
       engine.stop();loaded=false;activeRomStream=false;
       romFadePending=false;romFadeComplete=false;romFadeUiActive=false;++streamEpoch;
