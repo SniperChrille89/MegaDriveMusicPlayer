@@ -30,7 +30,6 @@ RomAudioResult renderSonic3KRom(const std::vector<uint8_t>& rom, uint8_t musicId
         const uint32_t ymClock=region==50?7600489u:7670454u;
         const unsigned frames=seconds*unsigned(region);
         for(unsigned frame=0;frame<frames;++frame) {
-            fadeClock.prepare(bus);
             cpu.requestInterrupt();
             // Carry fractional cycles across frames instead of discarding remainder.
             const uint64_t target=(uint64_t(frame+1)*cpuClock)/unsigned(region);
