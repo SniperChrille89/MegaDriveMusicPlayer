@@ -125,7 +125,7 @@ static void openStemExportDialog(){
     ShowWindow(dialog,SW_SHOW);
     SetForegroundWindow(dialog);
 }
-static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM){
+static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     constexpr int minuteId=5101,secondId=5102,exportId=5103;
     if(msg==WM_CREATE){
         CreateWindowW(L"STATIC",L"Length (minutes / seconds):",WS_CHILD|WS_VISIBLE,
@@ -187,7 +187,7 @@ static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM){
         }
     }
     if(msg==WM_CLOSE){exportDialogTrack=-1;DestroyWindow(hwnd);return 0;}
-    return DefWindowProcW(hwnd,msg,wp,0);
+    return DefWindowProcW(hwnd,msg,wp,lp);
 }
 #endif
 
