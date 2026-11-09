@@ -39,9 +39,9 @@ public:
     RomAudioChunk advanceFrames(unsigned frames);
     // Post an original Sonic 3K sound command, e.g. $E1 fade-out.
     void sendCommand(uint8_t command);
-    // Start a fixed-duration register fade independent of music loop count.
+    // Execute original $E1 with FM steps paced over exactly this many seconds.
     void beginFade(unsigned seconds);
-    // Switch in-place at the end of the fixed 3-second register fade, without a chip reset.
+    // Switch in-place near the end of the original driver fade, without a chip reset.
     void queueSongAfterFade(uint8_t musicId);
     void cancelQueuedSong();
 private:

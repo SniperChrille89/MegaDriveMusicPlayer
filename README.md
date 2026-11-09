@@ -105,3 +105,10 @@ See [README_CPU_ENGINE.md](README_CPU_ENGINE.md). The existing playable Windows 
 See `README_v019.md`. This is a ROM-derived Z80 CPU diagnostic, **not yet a complete ROM soundtrack player**.
 
 **New in v0.32:** seven-channel WAV stem export. See `README_v032.md`.
+
+## v0.37 native fade restoration
+
+See [README_v037.md](README_v037.md). The ROM playback path now uses Sonic 3K's
+original `$E1` fade algorithm and distributes its 40 native steps over the
+requested 3 / 5 second durations without altering FM modulation operators in
+host code.

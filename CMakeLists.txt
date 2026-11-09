@@ -134,12 +134,11 @@ if(BUILD_TESTING)
     add_test(NAME original_z80_seamless_transition_condition COMMAND mda_test_fade_transition)
 endif()
 
-
 if(BUILD_TESTING)
-    add_executable(mda_test_chip_fade tests/test_chip_fade.cpp)
-    target_include_directories(mda_test_chip_fade PRIVATE src)
-    target_compile_features(mda_test_chip_fade PRIVATE cxx_std_17)
-    add_test(NAME fixed_3s_5s_chip_register_fade COMMAND mda_test_chip_fade)
+    add_executable(mda_test_original_fade_clock tests/test_original_fade_clock.cpp)
+    target_include_directories(mda_test_original_fade_clock PRIVATE src)
+    target_compile_features(mda_test_original_fade_clock PRIVATE cxx_std_17)
+    add_test(NAME original_40_step_fade_3s_5s_steady_after_loops COMMAND mda_test_original_fade_clock)
 endif()
 
 if(NOT WIN32)

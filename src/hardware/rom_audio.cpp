@@ -1,7 +1,8 @@
 #include "rom_audio.h"
 #include "sonic_driver_image.h"
 #include "fade_transition.h"
-#include "chip_fade.h"
+#include "original_fade_clock.h"
+#include <atomic>
 #include "z80_driver.h"
 #include "vgm_trace.h"
 #include <algorithm>
@@ -29,6 +30,7 @@ RomAudioResult renderSonic3KRom(const std::vector<uint8_t>& rom, uint8_t musicId
         const uint32_t ymClock=region==50?7600489u:7670454u;
         const unsigned frames=seconds*unsigned(region);
         for(unsigned frame=0;frame<frames;++frame) {
+            fadeClock.prepare(bus);
             cpu.requestInterrupt();
             // Carry fractional cycles across frames instead of discarding remainder.
             const uint64_t target=(uint64_t(frame+1)*cpuClock)/unsigned(region);
@@ -60,9 +62,11 @@ struct Sonic3KStream::Impl {
     bool first=true;
     std::atomic<uint8_t> queuedCommand{0};
     std::atomic<uint8_t> nextMusic{0};
-    ChipFade chipFade;
-    std::atomic<unsigned> requestedFadeFrames{0};
+    bool fadeStarted=false;
+    bool fadeCountObserved=false;
     bool fadeEnded=false;
+    OriginalFadeClock fadeClock;
+    std::atomic<unsigned> requestedFadeFrames{0};
     explicit Impl(const std::vector<uint8_t>& rom, uint8_t id, int region)
       : cpu(bus),clock(region==50?3546895u:3579545u),
         ymClock(region==50?7600489u:7670454u),hz(region) {
@@ -88,20 +92,53 @@ struct Sonic3KStream::Impl {
     static void put32(std::vector<uint8_t>& v,size_t p,uint32_t val) {
         for(int i=0;i<4;i++)v[p+i]=uint8_t(val>>(8*i));
     }
-    void appendWrite(std::vector<uint8_t>& out,const SoundWrite& w) {
-        const uint64_t at=sampleAt(w.z80Cycle);
-        if(at>previousSample){wait(out,at-previousSample);previousSample=at;}
-        if(w.chip==Chip::PSG){out.push_back(0x50);out.push_back(w.value);return;}
-        const unsigned port=w.port&3,side=port/2;
-        if((port&1)==0)lastAddress[side]=w.value;
-        else if(lastAddress[side]>=0){
-            out.push_back(side?0x53:0x52);
-            out.push_back(uint8_t(lastAddress[side]));out.push_back(w.value);
-        }
-    }
     RomAudioChunk advanceFrames(unsigned frames) {
         RomAudioChunk result;
         if(frames==0 || frames>unsigned(hz)*60){result.error="Bad frame count";return result;}
+        for(unsigned f=0;f<frames;f++) {
+            bool switchedOnThisFrame=false;
+            // Write to the actual 68K->Z80 music command mailbox.
+            // Only the worker advancing this CPU ever touches bus RAM.
+            const unsigned fadeRequest=requestedFadeFrames.exchange(0);
+            if(fadeRequest){
+                fadeClock.begin(fadeRequest);
+                fadeStarted=true;fadeCountObserved=false;fadeEnded=false;
+                queuedCommand.store(0xE1);
+            }
+            const uint8_t command=queuedCommand.exchange(0);
+            if(command){
+                bus.z80Write(0x1c0a,command);
+                if(command==0xE1 || command==0xE5){
+                    fadeStarted=true;fadeCountObserved=false;fadeEnded=false;
+                    if(!fadeClock.active()) fadeClock.begin(unsigned(hz)*5);
+                } else if(command != 0xE2 && command != 0xE3) {
+                    // This command starts a new song in the SAME Z80 instance.
+                    fadeStarted=false;fadeCountObserved=false;fadeEnded=false;
+                    fadeClock.cancel();
+                    switchedOnThisFrame=true;
+                }
+            }
+            if(switchedOnThisFrame){result.songSwitched=true;result.switchedMusicId=command;}
+            fadeClock.prepare(bus);
+            cpu.requestInterrupt();
+            const uint64_t target=500000ull+(++completedFrames*uint64_t(clock))/unsigned(hz);
+            if(cpu.cycles()<target)cpu.runCycles(target-cpu.cycles());
+            if(fadeStarted){
+                fadeClock.observe(bus);
+                const uint8_t remaining=bus.z80RamRead(0x1c0d); // zFadeOutTimeout
+                if(remaining)fadeCountObserved=true;
+                // Trigger the new music while the old song still has two fade
+                // steps left. The next frame executes the normal Sonic 3K
+                // music mailbox command; no audio device or FM/PSG reset.
+                if(shouldQueueNextSong(fadeStarted,fadeCountObserved,remaining,nextMusic.load())
+                   && fadeClock.elapsedFrames() + 3 >= fadeClock.totalFrames()) {
+                    const uint8_t next=nextMusic.exchange(0);
+                    if(next)queuedCommand.store(next);
+                }
+                if(fadeClock.finished() && queuedCommand.load()==0)fadeEnded=true;
+            }
+        }
+        result.fadeFinished=fadeEnded;
         auto &out=result.vgm;
         if(first) {
             out.assign(0x40,0);
@@ -109,40 +146,18 @@ struct Sonic3KStream::Impl {
             put32(out,8,0x150);put32(out,0x0c,clock);
             put32(out,0x2c,ymClock);put32(out,0x34,0x0c);
         }
-        for(unsigned f=0;f<frames;f++) {
-            bool switchedOnThisFrame=false;
-            // Write to the actual 68K->Z80 music command mailbox.
-            // Only the worker advancing this CPU ever touches bus RAM.
-            const unsigned fadeRequest=requestedFadeFrames.exchange(0);
-            if(fadeRequest) { chipFade.begin(fadeRequest); fadeEnded=false; }
-            const uint8_t command=queuedCommand.exchange(0);
-            if(command){
-                bus.z80Write(0x1c0a,command);
-                // A new song must always start at full chip levels.
-                if(command!=0xE1 && command!=0xE5 && command!=0xE2 && command!=0xE3){
-                    chipFade.cancel();fadeEnded=false;
-                    switchedOnThisFrame=true;
-                }
-            }
-            if(switchedOnThisFrame){result.songSwitched=true;result.switchedMusicId=command;}
-            cpu.requestInterrupt();
-            const uint64_t target=500000ull+(++completedFrames*uint64_t(clock))/unsigned(hz);
-            if(cpu.cycles()<target)cpu.runCycles(target-cpu.cycles());
-            // Attenuate register writes and inject TL/PSG refreshes per frame.
-            // The game CPU, bank switching, channel loops and sound data are untouched.
-            auto writes=chipFade.frame(bus.trace(),cpu.cycles());
-            for(const auto& w:writes) appendWrite(result.vgm,w);
-            bus.clearTrace();
-            // Begin the incoming song on the last fade frame, before the
-            // outgoing tone reaches complete silence. Stop alone waits for
-            // the entire requested duration.
-            if(chipFade.active() && chipFade.remaining()<=1 && !fadeEnded){
-                const uint8_t next=nextMusic.exchange(0);
-                if(next) queuedCommand.store(next);
-                else if(chipFade.finished()) fadeEnded=true;
+        for(const auto& w:bus.trace()) {
+            const uint64_t at=sampleAt(w.z80Cycle);
+            if(at>previousSample){wait(out,at-previousSample);previousSample=at;}
+            if(w.chip==Chip::PSG){out.push_back(0x50);out.push_back(w.value);continue;}
+            const unsigned port=w.port&3,side=port/2;
+            if((port&1)==0)lastAddress[side]=w.value;
+            else if(lastAddress[side]>=0){
+                out.push_back(side?0x53:0x52);
+                out.push_back(uint8_t(lastAddress[side]));out.push_back(w.value);
             }
         }
-        result.fadeFinished=fadeEnded;
+        bus.clearTrace();
         const uint64_t end=sampleAt(cpu.cycles());
         if(end>previousSample){wait(out,end-previousSample);previousSample=end;}
         out.push_back(0x66); // appendable stream terminator
@@ -163,7 +178,13 @@ RomAudioChunk Sonic3KStream::advance(unsigned seconds){
     return impl_->advanceFrames(seconds*unsigned(impl_->hz));
 }
 RomAudioChunk Sonic3KStream::advanceFrames(unsigned frames){return impl_->advanceFrames(frames);}
-void Sonic3KStream::sendCommand(uint8_t command){impl_->queuedCommand.store(command);}
+void Sonic3KStream::sendCommand(uint8_t command){
+    // An immediate song selection must also cancel an unconsumed fade
+    // request, otherwise the worker could overwrite this music command with $E1.
+    if(command!=0xE1 && command!=0xE5 && command!=0xE2 && command!=0xE3)
+        impl_->requestedFadeFrames.store(0);
+    impl_->queuedCommand.store(command);
+}
 void Sonic3KStream::queueSongAfterFade(uint8_t id){impl_->nextMusic.store(id);}
 void Sonic3KStream::cancelQueuedSong(){impl_->nextMusic.store(0);}
 void Sonic3KStream::beginFade(unsigned seconds){
