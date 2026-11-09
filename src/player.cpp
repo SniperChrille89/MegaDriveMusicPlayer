@@ -75,19 +75,55 @@ static std::wstring safeExportFolder(std::wstring name){
     return name.empty()?L"Sonic 3K Track":name;
 }
 static LRESULT CALLBACK exportDialogProc(HWND,UINT,WPARAM,LPARAM);
+static int exportTrackSelection(){
+    // The list selection can be cleared by keyboard navigation or during playback.
+    // Export the explicitly selected song if possible; otherwise use the playing song.
+    int index=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);
+    if(index<0 || index>=(int)romTracks.size())index=current.load();
+    return (index>=0 && index<(int)romTracks.size())?index:-1;
+}
+static int exportDialogTrack=-1;
 static void openStemExportDialog(){
-    if(!romListMode){MessageBoxW(windowHandle,L"Open a Sonic 3K ROM first.",L"Export channel WAVs",MB_OK);return;}
-    if(exportBusy){MessageBoxW(windowHandle,L"An export is already running.",L"Export",MB_OK);return;}
-    const int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);
-    if(i<0 || i>=(int)romTracks.size())return;
+    if(!romListMode){
+        MessageBoxW(windowHandle,L"Open a Sonic 3K ROM first.",L"Export channel WAVs",MB_OK|MB_ICONINFORMATION);
+        return;
+    }
+    if(exportBusy.load()){
+        MessageBoxW(windowHandle,L"An export is already running.",L"Export channel WAVs",MB_OK|MB_ICONINFORMATION);
+        return;
+    }
+    const int selected=exportTrackSelection();
+    if(selected<0){
+        MessageBoxW(windowHandle,L"Select a song from the ROM track list before exporting.",
+                    L"Export channel WAVs",MB_OK|MB_ICONWARNING);
+        return;
+    }
     HINSTANCE h=(HINSTANCE)GetWindowLongPtrW(windowHandle,GWLP_HINSTANCE);
     static bool registered=false;
-    if(!registered){WNDCLASSW wc{};wc.lpfnWndProc=exportDialogProc;wc.hInstance=h;
-      wc.lpszClassName=L"MDAChannelExportDialog";wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
-      wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);registered=RegisterClassW(&wc)!=0;}
-    CreateWindowExW(WS_EX_DLGMODALFRAME,L"MDAChannelExportDialog",L"Export 7 Channel WAVs",
-      WS_CAPTION|WS_SYSMENU|WS_VISIBLE, CW_USEDEFAULT,CW_USEDEFAULT,395,195,
-      windowHandle,nullptr,h,nullptr);
+    if(!registered){
+        WNDCLASSW wc{};wc.lpfnWndProc=exportDialogProc;wc.hInstance=h;
+        wc.lpszClassName=L"MDAChannelExportDialog";
+        wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+        wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+        if(!RegisterClassW(&wc) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS){
+            MessageBoxW(windowHandle,L"Could not register the WAV export window.",
+                        L"Export channel WAVs",MB_OK|MB_ICONERROR);
+            return;
+        }
+        registered=true;
+    }
+    exportDialogTrack=selected;
+    HWND dialog=CreateWindowExW(WS_EX_DLGMODALFRAME,L"MDAChannelExportDialog",
+       L"Export 7 Channel WAVs",WS_CAPTION|WS_SYSMENU|WS_VISIBLE,
+       CW_USEDEFAULT,CW_USEDEFAULT,395,195,windowHandle,nullptr,h,nullptr);
+    if(!dialog){
+        MessageBoxW(windowHandle,L"Could not create the WAV export window.",
+                    L"Export channel WAVs",MB_OK|MB_ICONERROR);
+        exportDialogTrack=-1;
+        return;
+    }
+    ShowWindow(dialog,SW_SHOW);
+    SetForegroundWindow(dialog);
 }
 static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM){
     constexpr int minuteId=5101,secondId=5102,exportId=5103;
@@ -109,7 +145,7 @@ static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM){
     }
     if(msg==WM_COMMAND){
         const int id=LOWORD(wp);
-        if(id==IDCANCEL){DestroyWindow(hwnd);return 0;}
+        if(id==IDCANCEL){exportDialogTrack=-1;DestroyWindow(hwnd);return 0;}
         if(id==exportId){
             wchar_t mins[20]{},secs[20]{};
             GetWindowTextW(GetDlgItem(hwnd,minuteId),mins,20);
@@ -120,16 +156,22 @@ static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM){
                 return 0;
             }
             if(exportBusy.exchange(true))return 0;
-            const int idx=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);
+            const int idx=exportDialogTrack;
             std::shared_ptr<const std::vector<uint8_t>> rom;
             {std::lock_guard<std::mutex> lock(romMutex);rom=openedRom;}
-            if(!rom || idx<0 || idx>=(int)romTracks.size()){exportBusy=false;return 0;}
+            if(!rom || idx<0 || idx>=(int)romTracks.size()){
+                exportBusy=false;
+                MessageBoxW(hwnd,L"Export cannot start: ROM or selected song unavailable.",
+                            L"Export channel WAVs",MB_OK|MB_ICONWARNING);
+                return 0;
+            }
             mda::StemExportSettings opt;
             opt.rom=*rom;opt.musicId=romTracks[idx].command;
             opt.region=selectedRegion.load();opt.durationSeconds=unsigned(m*60+ss);
             std::wstring title=safeExportFolder(widenAscii(romTracks[idx].label));
             opt.destination=std::filesystem::path(appDirectory())/title;
             for(int i=0;i<4;i++)opt.gains[i]=volumePercent[i].load();
+            exportDialogTrack=-1;
             DestroyWindow(hwnd);
             showStatus(L"Exporting 7 synchronized WAV stems...");
             const HWND recipient=windowHandle;
@@ -144,7 +186,7 @@ static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM){
             return 0;
         }
     }
-    if(msg==WM_CLOSE){DestroyWindow(hwnd);return 0;}
+    if(msg==WM_CLOSE){exportDialogTrack=-1;DestroyWindow(hwnd);return 0;}
     return DefWindowProcW(hwnd,msg,wp,0);
 }
 #endif
