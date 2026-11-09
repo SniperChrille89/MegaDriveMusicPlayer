@@ -47,7 +47,7 @@ void MegaDriveEngine::reset() {
     ymWrites_.clear(); ymWriteStage_=0; ymWriteDelay_=0; ymActive_={};
     initialYMPrimeClocks_=0; initialYMPrimeWrites_=0; initialYMPrimed_=false;
     std::memset(registers_,0,sizeof registers_);
-    clockFrac_=0; lowpassL_=lowpassR_=0; reconstructHead_=0; reconstruct_={}; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
+    clockFrac_=0; lowpassL_=lowpassR_=0; reconstructHead_=0; reconstruct_={}; stemReconstruct_={}; captureStems_=false; eventFrac_=0; samples_=0; wait_=0; pcm_.clear();pcmIndex_=0;
     fading_=paused_=false;pauseTailFrames_=0;fadeStep_=fadeCounter_=0;finished_=false;
 }
 bool MegaDriveEngine::load(const std::vector<uint8_t>& bytes,std::string& error) {
@@ -315,6 +315,17 @@ void MegaDriveEngine::sample(int16_t* output) {
         reconstruct_[bus+1][reconstructHead_]=float(b[1])/256.f;
         reconstruct_[2-bus][reconstructHead_]=0.f;
         reconstruct_[3-bus][reconstructHead_]=0.f;
+        if(captureStems_){
+            // YM output slot order per 24 clocks: FM2, FM6/DAC, FM4,
+            // FM1, FM5, FM3. This is NOT channel-number order.
+            static constexpr int slotToStem[6]={2,6,4,1,5,3};
+            const int stem=slotToStem[(ym_.cycles+23)%24/4];
+            for(int k=1;k<=6;k++){
+                const int offset=(k-1)*2;
+                stemReconstruct_[offset][reconstructHead_]=k==stem?float(b[0])/256.f:0.f;
+                stemReconstruct_[offset+1][reconstructHead_]=k==stem?float(b[1])/256.f:0.f;
+            }
+        }
         reconstructHead_=(reconstructHead_+1)%FirTaps;
     }
     const auto& taps=reconstructionKernel();
@@ -327,6 +338,7 @@ void MegaDriveEngine::sample(int16_t* output) {
     }
     psg_.clock=(double)psgClock_*psgScale;
     const float psg=(paused_?0.0f:psg_.render()*psgGain_*.23f);
+    lastPsg_=psg;
     // Both buses originate in the same Nuked YM2612 output. Combined mode
     // uses a single gain for the full output and is the reference for checking
     // whether our experimental DAC/FM split colors the sound.
@@ -356,4 +368,35 @@ void MegaDriveEngine::sample(int16_t* output) {
 }
 void MegaDriveEngine::render(int16_t* dst,int frames){
     for(int i=0;i<frames;i++){tick();sample(dst+i*2);}
+}
+
+void MegaDriveEngine::stemSample(int16_t* out14){
+    const auto& taps=reconstructionKernel();
+    for(int k=0;k<7;k++){
+        if(k==0){
+            const float signal=lastPsg_*kOutputGain*masterGain_;
+            out14[0]=out14[1]=static_cast<int16_t>(clamp16(signal));
+            continue;
+        }
+        const int bus=(k-1)*2;
+        float left=0.f,right=0.f;
+        int index=(reconstructHead_+FirTaps-1)%FirTaps;
+        for(int j=0;j<FirTaps;j++){
+            left+=stemReconstruct_[bus][index]*taps[j];
+            right+=stemReconstruct_[bus+1][index]*taps[j];
+            if(--index<0)index=FirTaps-1;
+        }
+        const float gain=(k==6?dacGain_:fmGain_)*.77f*kOutputGain*masterGain_;
+        out14[k*2]=static_cast<int16_t>(clamp16(left*gain));
+        out14[k*2+1]=static_cast<int16_t>(clamp16(right*gain));
+    }
+}
+void MegaDriveEngine::renderStems(int16_t* out14,int frames){
+    captureStems_=true;
+    int16_t dummy[2]{};
+    for(int i=0;i<frames;i++){
+        tick();sample(dummy);
+        stemSample(out14+i*14);
+    }
+    captureStems_=false;
 }

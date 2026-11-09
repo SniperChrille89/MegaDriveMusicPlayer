@@ -23,6 +23,7 @@
 #include <cmath>
 #ifdef MDA_ROM_AUDIO_ENABLED
 #include "hardware/rom_audio.h"
+#include "hardware/stem_export.h"
 #include "hardware/fade_transition.h"
 #endif
 #include "engine.h"
@@ -56,8 +57,98 @@ static std::atomic<int> selectedTimingProfile{0}; // preserve VGM timestamps by 
 static std::atomic<int> currentFileRate{60};
 static std::atomic<bool> currentFileRateDeclared{false};
 static std::thread audioThread;
-static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_STOP=106,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306,CTRL_OPEN_ROM=307,CTRL_ROM_LIST=308;
+static const int CTRL_OPEN=101,CTRL_PLAY=102,CTRL_PREV=103,CTRL_NEXT=104,CTRL_STOP=106,CTRL_LIST=105,CTRL_PSG=201,CTRL_FM=202,CTRL_DAC=203,CTRL_MASTER=204,CTRL_PAL=301,CTRL_NTSC=302,CTRL_PROFILE=303,CTRL_COMBINED=304,CTRL_LOWPASS=305,CTRL_FILTER_STRENGTH=306,CTRL_OPEN_ROM=307,CTRL_ROM_LIST=308,CTRL_EXPORT_STEMS=309;
 static const UINT WM_STATUS=WM_APP+10;
+static const UINT WM_EXPORT_DONE=WM_APP+45;
+static std::wstring appDirectory();
+static std::wstring widenAscii(const std::string&);
+static void showStatus(const std::wstring&);
+static std::atomic<bool> exportBusy{false};
+#ifdef MDA_ROM_AUDIO_ENABLED
+static std::wstring safeExportFolder(std::wstring name){
+    // Trim the diagnostic [$xx] suffix from the human-readable song title.
+    const auto at=name.rfind(L" [$");
+    if(at!=std::wstring::npos)name.resize(at);
+    for(auto& c:name)if(c==L'<'||c==L'>'||c==L':'||c==L'"'||c==L'/'||
+                       c==L'\\'||c==L'|'||c==L'?'||c==L'*')c=L'_';
+    while(!name.empty() && (name.back()==L' '||name.back()==L'.'))name.pop_back();
+    return name.empty()?L"Sonic 3K Track":name;
+}
+static LRESULT CALLBACK exportDialogProc(HWND,UINT,WPARAM,LPARAM);
+static void openStemExportDialog(){
+    if(!romListMode){MessageBoxW(windowHandle,L"Open a Sonic 3K ROM first.",L"Export channel WAVs",MB_OK);return;}
+    if(exportBusy){MessageBoxW(windowHandle,L"An export is already running.",L"Export",MB_OK);return;}
+    const int i=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);
+    if(i<0 || i>=(int)romTracks.size())return;
+    HINSTANCE h=(HINSTANCE)GetWindowLongPtrW(windowHandle,GWLP_HINSTANCE);
+    static bool registered=false;
+    if(!registered){WNDCLASSW wc{};wc.lpfnWndProc=exportDialogProc;wc.hInstance=h;
+      wc.lpszClassName=L"MDAChannelExportDialog";wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+      wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);registered=RegisterClassW(&wc)!=0;}
+    CreateWindowExW(WS_EX_DLGMODALFRAME,L"MDAChannelExportDialog",L"Export 7 Channel WAVs",
+      WS_CAPTION|WS_SYSMENU|WS_VISIBLE, CW_USEDEFAULT,CW_USEDEFAULT,395,195,
+      windowHandle,nullptr,h,nullptr);
+}
+static LRESULT CALLBACK exportDialogProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM){
+    constexpr int minuteId=5101,secondId=5102,exportId=5103;
+    if(msg==WM_CREATE){
+        CreateWindowW(L"STATIC",L"Length (minutes / seconds):",WS_CHILD|WS_VISIBLE,
+          18,17,280,20,hwnd,nullptr,nullptr,nullptr);
+        CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"3",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_AUTOHSCROLL,
+          18,43,65,27,hwnd,(HMENU)(INT_PTR)minuteId,nullptr,nullptr);
+        CreateWindowW(L"STATIC",L":",WS_CHILD|WS_VISIBLE,89,48,10,20,hwnd,nullptr,nullptr,nullptr);
+        CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"00",WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_AUTOHSCROLL,
+          104,43,65,27,hwnd,(HMENU)(INT_PTR)secondId,nullptr,nullptr);
+        CreateWindowW(L"STATIC",L"Stereo PCM, 44,100 Hz, 16 bit. One folder per song.",
+          WS_CHILD|WS_VISIBLE,18,81,352,25,hwnd,nullptr,nullptr,nullptr);
+        CreateWindowW(L"BUTTON",L"Export",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
+          18,115,150,29,hwnd,(HMENU)(INT_PTR)exportId,nullptr,nullptr);
+        CreateWindowW(L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE,
+          184,115,150,29,hwnd,(HMENU)(INT_PTR)IDCANCEL,nullptr,nullptr);
+        return 0;
+    }
+    if(msg==WM_COMMAND){
+        const int id=LOWORD(wp);
+        if(id==IDCANCEL){DestroyWindow(hwnd);return 0;}
+        if(id==exportId){
+            wchar_t mins[20]{},secs[20]{};
+            GetWindowTextW(GetDlgItem(hwnd,minuteId),mins,20);
+            GetWindowTextW(GetDlgItem(hwnd,secondId),secs,20);
+            const int m=_wtoi(mins),ss=_wtoi(secs);
+            if(m<0||m>60||ss<0||ss>=60||m*60+ss<=0||m*60+ss>3600){
+                MessageBoxW(hwnd,L"Choose a duration from 0:01 to 60:00.",L"Invalid duration",MB_OK|MB_ICONWARNING);
+                return 0;
+            }
+            if(exportBusy.exchange(true))return 0;
+            const int idx=(int)SendMessageW(listHandle,LB_GETCURSEL,0,0);
+            std::shared_ptr<const std::vector<uint8_t>> rom;
+            {std::lock_guard<std::mutex> lock(romMutex);rom=openedRom;}
+            if(!rom || idx<0 || idx>=(int)romTracks.size()){exportBusy=false;return 0;}
+            mda::StemExportSettings opt;
+            opt.rom=*rom;opt.musicId=romTracks[idx].command;
+            opt.region=selectedRegion.load();opt.durationSeconds=unsigned(m*60+ss);
+            std::wstring title=safeExportFolder(widenAscii(romTracks[idx].label));
+            opt.destination=std::filesystem::path(appDirectory())/title;
+            for(int i=0;i<4;i++)opt.gains[i]=volumePercent[i].load();
+            DestroyWindow(hwnd);
+            showStatus(L"Exporting 7 synchronized WAV stems...");
+            const HWND recipient=windowHandle;
+            std::thread([opt=std::move(opt),recipient]() mutable {
+                const auto r=mda::exportSonic3KStems(opt);
+                const std::wstring msg=r.ok?(L"Export completed: "+opt.destination.wstring()):
+                     (L"Export failed: "+std::wstring(r.error.begin(),r.error.end()));
+                auto text=new std::wstring(msg);
+                if(!PostMessageW(recipient,WM_EXPORT_DONE,r.ok?1:0,(LPARAM)text))delete text;
+                exportBusy=false;
+            }).detach();
+            return 0;
+        }
+    }
+    if(msg==WM_CLOSE){DestroyWindow(hwnd);return 0;}
+    return DefWindowProcW(hwnd,msg,wp,0);
+}
+#endif
+
 // Timeline intentionally removed. ROM playback continues without a seek bar.
 static std::atomic<uint64_t> playPosition{0}, playDuration{0}, playLoopStart{UINT64_MAX};
 static std::atomic<uint64_t> seekRequested{UINT64_MAX};
@@ -522,6 +613,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       CreateWindowW(L"BUTTON",L"Play / Pause",WS_CHILD|WS_VISIBLE,171,331,135,36,hwnd,(HMENU)CTRL_PLAY,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L"Stop",WS_CHILD|WS_VISIBLE,317,331,85,36,hwnd,(HMENU)CTRL_STOP,nullptr,nullptr);
       CreateWindowW(L"BUTTON",L">>",WS_CHILD|WS_VISIBLE,413,331,90,36,hwnd,(HMENU)CTRL_NEXT,nullptr,nullptr);
+      CreateWindowW(L"BUTTON",L"Export 7 Channel WAVs...",WS_CHILD|WS_VISIBLE,
+        314,625,252,29,hwnd,(HMENU)(INT_PTR)CTRL_EXPORT_STEMS,nullptr,nullptr);
       statusHandle=CreateWindowW(L"STATIC",L"Select PAL or NTSC, then open a VGM/VGZ",WS_CHILD|WS_VISIBLE,
         12,83,555,20,hwnd,nullptr,nullptr,nullptr);
       // Four independent mix buses; 100% is the original v0.4 mix level.
@@ -584,6 +677,13 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       if(id==CTRL_LOWPASS)analogLowpass=(SendMessageW(GetDlgItem(hwnd,CTRL_LOWPASS),BM_GETCHECK,0,0)==BST_CHECKED);
       if(id==CTRL_OPEN)openSong();
       if(id==CTRL_OPEN_ROM)openRom();
+      if(id==CTRL_EXPORT_STEMS){
+#ifdef MDA_ROM_AUDIO_ENABLED
+          openStemExportDialog();
+#else
+          MessageBoxW(hwnd,L"Z80 audio support is not enabled in this build.",L"Export",MB_OK);
+#endif
+      }
       if(id==CTRL_PROFILE && HIWORD(w)==CBN_SELCHANGE){
         const int profile=(int)SendMessageW(profileHandle,CB_GETCURSEL,0,0);
         if(profile>=0 && profile<=2)selectedTimingProfile=profile;
@@ -649,6 +749,12 @@ static LRESULT CALLBACK wndProc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
       }
       return 0;
     }
+    case WM_EXPORT_DONE:{
+      std::unique_ptr<std::wstring> result((std::wstring*)l);
+      if(result){showStatus(*result);MessageBoxW(hwnd,result->c_str(),L"Channel WAV Export",
+         MB_OK|(w?MB_ICONINFORMATION:MB_ICONERROR));}
+      return 0;
+    }
     case WM_DESTROY:running=false;PostQuitMessage(0);return 0;
   }
   return DefWindowProcW(hwnd,msg,w,l);
@@ -658,7 +764,7 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,LPWSTR,int show){
   wc.hCursor=LoadCursor(nullptr,IDC_ARROW);wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);
   if(!RegisterClassW(&wc))return 1;
   windowHandle=CreateWindowExW(0,wc.lpszClassName,L"Mega Drive Audio — Desktop Test",WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT,CW_USEDEFAULT,595,690,nullptr,nullptr,inst,nullptr);
+    CW_USEDEFAULT,CW_USEDEFAULT,595,720,nullptr,nullptr,inst,nullptr);
   if(!windowHandle)return 2;
   ShowWindow(windowHandle,show);UpdateWindow(windowHandle);
   audioThread=std::thread(audioWorker);

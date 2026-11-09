@@ -103,3 +103,5 @@ See [README_CPU_ENGINE.md](README_CPU_ENGINE.md). The existing playable Windows 
 
 ## Experimental v0.19 ROM driver bootstrap test
 See `README_v019.md`. This is a ROM-derived Z80 CPU diagnostic, **not yet a complete ROM soundtrack player**.
+
+**New in v0.32:** seven-channel WAV stem export. See `README_v032.md`.

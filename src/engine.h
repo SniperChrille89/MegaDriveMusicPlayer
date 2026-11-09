@@ -11,6 +11,9 @@ class MegaDriveEngine {
 public:
     bool load(const std::vector<uint8_t>& bytes, std::string& error);
     void render(int16_t* stereo, int frames);
+    // Seven synchronous stereo stems: PSG, FM1..FM5, FM6/DAC.
+    // All taps are captured from ONE Nuked YM2612 chip instance.
+    void renderStems(int16_t* interleaved14, int frames);
     // Extend a ROM-backed VGM without resetting the chip, DAC or FIR state.
     // next contains VGM opcodes and a final 0x66 (no header).
     bool appendRomCommands(const std::vector<uint8_t>& next, uint64_t totalSamples);
@@ -85,6 +88,11 @@ private:
     static constexpr int FirTaps = 385;
     std::array<std::array<float, FirTaps>, 4> reconstruct_{};
     int reconstructHead_ = 0;
+    // Native YM2612 slot-separated rings, enabled only during offline export.
+    std::array<std::array<float, FirTaps>, 12> stemReconstruct_{};
+    bool captureStems_=false;
+    float lastPsg_=0.f;
+    void stemSample(int16_t* out14);
     double clockFrac_=0;
     double eventFrac_=0;
     int sourceRate_=60, targetRate_=60, timingProfile_=0;
